@@ -20,12 +20,14 @@ use crate::model::view::{
     CompactionState, LineState, LineView, RowKind, SideLine, TaskTarget, ViewRow, ViewSnapshot,
 };
 use crate::ui::Env;
+use crate::ui::Initial;
 use crate::ui::approvals_panel::ApprovalsPanel;
 use crate::ui::commands::{COMMANDS, Context as CommandContext, Needs};
 use crate::ui::composer::{Composer, Outcome as ComposerOutcome, Shell, history};
 use crate::ui::i18n::{self, t, tf};
 use crate::ui::language_panel::LanguagePanel;
 use crate::ui::lines_panel::{LinesPanel, short_id};
+use crate::ui::list_panel::{Event as ListEvent, Item, ListPanel};
 use crate::ui::management_panel::ManagementPanel;
 use crate::ui::models_panel::ModelsPanel;
 use crate::ui::oauth_view::OauthView;
@@ -35,6 +37,7 @@ use crate::ui::prompts::{
     AskUserPrompt, Effect, EffortPrompt, ExitConfirm, ExitReason, PermissionPrompt, WriteTarget,
 };
 use crate::ui::providers_panel::ProvidersPanel;
+use crate::ui::queue_panel::QueuePanel;
 use crate::ui::render::fullscreen::Document;
 use crate::ui::render::fullscreen::MouseOutcome;
 use crate::ui::render::markdown::MarkdownRenderer;
@@ -270,6 +273,7 @@ fn run_terminal(
         cwd_key,
     );
     app.fullscreen = full.is_some();
+    app.initial = surroundings.initial;
     app.terminal_clipboard =
         terminal.clipboard_protocol() && crate::clipboard::terminal::native_unreachable();
     app.host.send(Command::LoginStatus(DIM_OAUTH_ID.into()));
@@ -306,8 +310,10 @@ fn run_terminal(
             title.forget();
             dirty = true;
         }
-        if app.shutdown.is_some() && !dirty {
-            break 0;
+        if let Some(code) = app.exit_code
+            && !dirty
+        {
+            break code;
         }
         if app.revealing() {
             dirty = true;
@@ -463,7 +469,14 @@ fn run_terminal(
             _ if app.running() => FRAME_INTERVAL,
             _ => SESSION_POLL,
         };
-        match terminal.next_event(wait) {
+        // The first message waits for the first frame so it follows the
+        // banner, then enters the interface as the submission event.
+        let next = if app.initial.is_some() && last_frame.is_some() {
+            Wait::Event(InputEvent::Submit)
+        } else {
+            terminal.next_event(wait)
+        };
+        match next {
             Wait::Lost => {
                 let code = terminal.lost();
                 app.host.shutdown();
@@ -841,9 +854,7 @@ struct App {
     /// The adopted model and its reasoning effort, once the session exists.
     label: Option<ModelLabel>,
     failure: Option<String>,
-    /// The App Server asked this interface to leave: one more frame shows
-    /// why, then the interface exits and the Session carries on.
-    shutdown: Option<String>,
+    exit_code: Option<i32>,
     failure_committed: bool,
     planner: StreamPlanner,
     commits: CommitState,
@@ -892,6 +903,12 @@ struct App {
     /// The second their running time was last drawn for.
     card_second: u64,
     session_id: String,
+    /// The invocation's first message, submitted once the first frame is
+    /// drawn.
+    initial: Option<Initial>,
+    /// A submitted first message no Session has taken yet: a refusal puts
+    /// it back into the draft.
+    unsent: Option<Initial>,
     permission_policy: dim_agent_types::PermissionPolicy,
     /// The main branch's context use.
     context: Option<ContextReading>,
@@ -995,9 +1012,6 @@ struct App {
     /// The entry a management action the panel sent names, with the label the
     /// panel showed then: the panel may close before the reply lands.
     management_named: Option<(Area, ManagementAction, Option<String>)>,
-    /// Queued messages withdrawn for the draft, by input id, until the host
-    /// confirms each withdrawal; a confirmed one goes into the draft.
-    recovering: Vec<(String, String)>,
     /// The message the Session offered for the turn its composer belongs to.
     suggestion: Option<Suggestion>,
     /// The `prompt-suggestion` switch as last read or written; none until a
@@ -1182,6 +1196,8 @@ enum Prompt {
     Tasks(TasksPanel),
     Lines(Box<LinesPanel>),
     Timeline(Box<TimelinePanel>),
+    Queue(QueuePanel),
+    Export(ListPanel),
     Fork(ForkAsk),
     Models(ModelsPanel),
     Providers(Box<ProvidersPanel>),
@@ -1232,7 +1248,7 @@ impl App {
             snapshot: None,
             label: None,
             failure: None,
-            shutdown: None,
+            exit_code: None,
             failure_committed: false,
             planner: StreamPlanner::new(),
             commits: CommitState::default(),
@@ -1256,6 +1272,8 @@ impl App {
             message_blocks: Vec::new(),
             card_second: 0,
             session_id: String::new(),
+            initial: None,
+            unsent: None,
             permission_policy: dim_agent_types::PermissionPolicy {
                 preset: dim_agent_types::PermissionPreset::WorkspaceWrite,
                 ..Default::default()
@@ -1304,7 +1322,6 @@ impl App {
             fork_draft: None,
             management_edits: Vec::new(),
             management_named: None,
-            recovering: Vec::new(),
             suggestion: None,
             suggestion_setting: None,
             suggestion_methods: false,
@@ -1520,7 +1537,7 @@ impl App {
     /// Sends the oldest queued message in as steering (Ctrl+S, and Enter on an
     /// empty draft).
     fn steer(&mut self) {
-        if let Some((id, _)) = self.queued().into_iter().next() {
+        if let Some(id) = self.queued().into_iter().next() {
             self.host.send(Command::InputControl {
                 input_id: id,
                 action: "steer",
@@ -1542,8 +1559,8 @@ impl App {
 
     /// Withdraws the newest queued message into the draft (Shift+Left).
     fn recall_newest_queued(&mut self) {
-        if let Some((id, text)) = self.queued().pop() {
-            self.withdraw(id, text);
+        if let Some(id) = self.queued().pop() {
+            self.withdraw(id);
         }
     }
 
@@ -1551,32 +1568,31 @@ impl App {
     /// withdrawals reach the session before its stop, so no queued message
     /// starts the next run.
     fn recall_all_queued(&mut self) {
-        for (id, text) in self.queued() {
-            self.withdraw(id, text);
+        for id in self.queued() {
+            self.host.send(Command::InputControl {
+                input_id: id,
+                action: "withdraw",
+            });
         }
     }
 
-    fn withdraw(&mut self, id: String, text: String) {
-        self.recovering.push((id.clone(), text));
+    fn withdraw(&mut self, id: String) {
+        if self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .queued
+                .iter()
+                .any(|input| input.id == id && !input.recallable)
+        }) {
+            self.notices.push(
+                t("Messages with attachments stay queued; use /queue to steer or delete them")
+                    .into(),
+            );
+            return;
+        }
         self.host.send(Command::InputControl {
             input_id: id,
             action: "withdraw",
         });
-    }
-
-    /// Puts a withdrawn message into the draft after the text already there,
-    /// once the session confirmed the withdrawal.
-    fn restore_withdrawn(&mut self, input_id: &str) {
-        let Some(at) = self.recovering.iter().position(|(id, _)| id == input_id) else {
-            return;
-        };
-        let (_, text) = self.recovering.remove(at);
-        let draft = self.composer.text();
-        if draft.trim().is_empty() {
-            self.set_draft(&text);
-        } else {
-            self.set_draft(&format!("{draft}\n{text}"));
-        }
     }
 
     fn set_notice(&mut self, text: impl Into<String>) {
@@ -1633,6 +1649,8 @@ impl App {
             | Some(Prompt::Isolation(_))
             | Some(Prompt::Lines(_))
             | Some(Prompt::Timeline(_))
+            | Some(Prompt::Queue(_))
+            | Some(Prompt::Export(_))
             | Some(Prompt::Fork(_)) => {}
             Some(Prompt::Tasks(_)) if approval.is_none() && question.is_none() => {}
             Some(Prompt::Upgrade(_)) if approval.is_none() && question.is_none() => {}
@@ -1788,14 +1806,15 @@ impl App {
 
     /// Queued inputs, oldest first: submitted while a turn was already
     /// running, without their `input/applied` yet.
-    fn queued(&self) -> Vec<(String, String)> {
+    fn queued(&self) -> Vec<String> {
         self.snapshot
             .as_ref()
             .map(|snapshot| {
                 snapshot
                     .queued
                     .iter()
-                    .map(|input| (input.id.clone(), input.text.clone()))
+                    .filter(|input| input.held)
+                    .map(|input| input.id.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -1803,7 +1822,17 @@ impl App {
 
     fn apply(&mut self, update: Update) {
         match update {
-            Update::Withdrawn { input_id } => self.restore_withdrawn(&input_id),
+            Update::Withdrawn(input) => {
+                self.dismiss_suggestion();
+                self.composer.restore(input);
+            }
+            Update::Exported { format, path } => self.notices.push(tf(
+                "Exported {format}: {path}",
+                &[
+                    ("format", format.label()),
+                    ("path", &crate::sanitize::safe(&path.display().to_string())),
+                ],
+            )),
             Update::Ready(configuration) => {
                 self.label = Some(ModelLabel::new(&configuration));
             }
@@ -1838,6 +1867,13 @@ impl App {
                     }
                 }
                 if let Some(Prompt::Timeline(panel)) = &mut self.prompt {
+                    if panel.current(&snapshot) {
+                        panel.set_rows(&snapshot);
+                    } else {
+                        self.prompt = None;
+                    }
+                }
+                if let Some(Prompt::Queue(panel)) = &mut self.prompt {
                     if panel.current(&snapshot) {
                         panel.set_rows(&snapshot);
                     } else {
@@ -1913,7 +1949,12 @@ impl App {
                     &[("count", &count.to_string())],
                 ));
             }
-            Update::Switched { session_id, kind } => self.switch_session(session_id, kind),
+            Update::Switched { session_id, kind } => {
+                if !session_id.is_empty() {
+                    self.unsent = None;
+                }
+                self.switch_session(session_id, kind)
+            }
             Update::Skills(entries) => {
                 self.composer.set_skills(
                     entries
@@ -2371,7 +2412,7 @@ impl App {
                 }
             }
             Update::Notice(text) => {
-                self.notices.push(text);
+                self.notices.push(t(&text).to_owned());
             }
             Update::Upgrade(offer) => {
                 self.upgrade = Some(UpgradeDialog::new(offer));
@@ -2393,15 +2434,31 @@ impl App {
                     .remove(&(branch_id.clone(), request_id.clone()));
             }
             Update::Failed(message) => {
+                self.restore_unsent();
                 self.failure = Some(message);
                 self.run_started = None;
+            }
+            Update::SubmitNotSent(message) => {
+                self.notices.push(message);
+                self.restore_unsent();
+            }
+            Update::StartupFailed(message) => {
+                self.failure = Some(message);
+                // A first message the invocation supplied has no Session
+                // to take it: keep it in the draft and stay, rather than
+                // exiting nonzero with nothing sent.
+                if self.initial.is_some() || self.unsent.is_some() {
+                    self.restore_unsent();
+                } else {
+                    self.exit_code = Some(1);
+                }
             }
             Update::Shutdown { reason } => {
                 self.notices.push(tf(
                     "The App Server closed this interface: {reason}",
                     &[("reason", &reason)],
                 ));
-                self.shutdown = Some(reason);
+                self.exit_code = Some(0);
             }
         }
     }
@@ -2421,6 +2478,7 @@ impl App {
 
     fn handle_input(&mut self, event: InputEvent) -> Outcome {
         let key = match event {
+            InputEvent::Submit => return self.submit_initial(),
             InputEvent::Paste(text) => {
                 if self.command_entry_open() {
                     self.paste(text);
@@ -2510,6 +2568,16 @@ impl App {
                 Prompt::Tasks(p) => p.handle_key(key),
                 Prompt::Lines(p) => p.handle_key(key),
                 Prompt::Timeline(p) => p.handle_key(key),
+                Prompt::Queue(p) => p.handle_key(key),
+                Prompt::Export(p) => match p.handle_key(key) {
+                    ListEvent::Pick(format) => Effect::Export(if format == "markdown" {
+                        crate::export::Format::Markdown
+                    } else {
+                        crate::export::Format::Json
+                    }),
+                    ListEvent::Close => Effect::Close,
+                    ListEvent::None | ListEvent::Refresh => Effect::None,
+                },
                 Prompt::Fork(p) => p.handle_key(key),
                 Prompt::Models(p) => p.handle_key(key),
                 Prompt::Providers(p) => p.handle_key(key),
@@ -2645,6 +2713,21 @@ impl App {
             _ => {}
         }
         match self.composer.handle_key(key) {
+            ComposerOutcome::Command { name, args } => return self.run_command(&name, &args),
+            outcome => {
+                self.dispatch_composer(outcome, mode);
+            }
+        }
+        if self.suggestion.is_some() && !self.composer.is_empty() {
+            self.dismiss_suggestion();
+        }
+        Outcome::Continue
+    }
+
+    /// What a composer outcome does, the same for Enter and for the
+    /// invocation's first message.
+    fn dispatch_composer(&mut self, outcome: ComposerOutcome, mode: SubmitMode) -> Outcome {
+        match outcome {
             ComposerOutcome::Submit(text) if self.line_draft.is_some() => {
                 self.open_line(&text);
             }
@@ -2693,10 +2776,54 @@ impl App {
             ComposerOutcome::Rejected(reason) => self.set_notice(reason),
             ComposerOutcome::Handled | ComposerOutcome::Pass => {}
         }
-        if self.suggestion.is_some() && !self.composer.is_empty() {
-            self.dismiss_suggestion();
-        }
         Outcome::Continue
+    }
+
+    /// Sends the invocation's first message as its first typed one: the text
+    /// becomes the draft and the images its tokens, then the composer
+    /// submits them through the same outcome the Enter key produces. A
+    /// submission no Session takes leaves the message unsent so a refusal
+    /// can put it back into the draft.
+    fn submit_initial(&mut self) -> Outcome {
+        let Some(initial) = self.initial.take() else {
+            return Outcome::Continue;
+        };
+        self.composer.set_draft(&initial.text);
+        for image in &initial.images {
+            let _ = self.composer.attach_image(image.clone());
+        }
+        // A failed session has taken the connection: the message is not
+        // sent, and stays a draft the user can carry to a restart.
+        if self.failure.is_some() {
+            return Outcome::Continue;
+        }
+        let outcome = self.composer.submit();
+        let submitted = matches!(
+            outcome,
+            ComposerOutcome::Submit(_) | ComposerOutcome::SubmitDraft { .. }
+        ) && self.line_draft.is_none();
+        if submitted && self.session_id.is_empty() {
+            self.unsent = Some(initial);
+        }
+        self.dispatch_composer(outcome, SubmitMode::Queue)
+    }
+
+    /// Puts a first message no Session took back into the draft, unless the
+    /// user has started another one: that newer draft wins, and the loss of
+    /// the first message is reported so it is not silent.
+    fn restore_unsent(&mut self) {
+        let Some(initial) = self.unsent.take() else {
+            return;
+        };
+        if !self.composer.is_empty() {
+            self.notices
+                .push(t("The first message was not sent; your new draft was kept.").to_owned());
+            return;
+        }
+        self.composer.set_draft(&initial.text);
+        for image in initial.images {
+            let _ = self.composer.attach_image(image);
+        }
     }
 
     /// A terminal paste, which is also how a terminal delivers a file
@@ -3130,6 +3257,13 @@ impl App {
                 });
             }
             Effect::Notice(text) => self.set_notice(text),
+            Effect::InputControl { input_id, action } => {
+                self.host.send(Command::InputControl { input_id, action });
+            }
+            Effect::Export(format) => {
+                self.prompt = None;
+                self.host.send(Command::Export(format));
+            }
             Effect::FocusLine(line) => {
                 self.prompt = None;
                 self.host.send(Command::FocusLine(line));
@@ -4036,6 +4170,26 @@ impl App {
                 self.host.send(Command::Compact);
                 Outcome::Continue
             }
+            "export" => {
+                let mut panel = ListPanel::new(
+                    "Export session",
+                    t("Enter export · Esc cancel"),
+                    "",
+                    "",
+                    "",
+                    false,
+                )
+                .without_filter();
+                panel.set_items(
+                    Ok(vec![
+                        Item::new("markdown", "Markdown (.md)", ""),
+                        Item::new("json", "JSON (.json)", ""),
+                    ]),
+                    Some("markdown"),
+                );
+                self.open_prompt(Prompt::Export(panel));
+                Outcome::Continue
+            }
             "rename" => {
                 let title = args.trim();
                 let title = if title == "--clear" {
@@ -4101,6 +4255,13 @@ impl App {
                 if let Some(snapshot) = &self.snapshot {
                     let panel = TimelinePanel::new(snapshot);
                     self.open_prompt(Prompt::Timeline(Box::new(panel)));
+                }
+                Outcome::Continue
+            }
+            "queue" => {
+                if let Some(snapshot) = &self.snapshot {
+                    let panel = QueuePanel::new(snapshot);
+                    self.open_prompt(Prompt::Queue(panel));
                 }
                 Outcome::Continue
             }
@@ -4470,7 +4631,11 @@ impl App {
                 .map(|input| {
                     (
                         input.id.clone(),
-                        input.display.as_deref().unwrap_or(&input.text).to_owned(),
+                        format!(
+                            "{} · {}",
+                            t(if input.held { "Held" } else { "Incorporating" }),
+                            input.display.as_deref().unwrap_or(&input.text)
+                        ),
                     )
                 })
                 .collect();
@@ -4694,6 +4859,8 @@ impl App {
                         | Prompt::Upgrade(_)
                         | Prompt::Fork(_)
                         | Prompt::Timeline(_)
+                        | Prompt::Queue(_)
+                        | Prompt::Export(_)
                 )
             );
         if !replaced {
@@ -4718,6 +4885,8 @@ impl App {
             Some(Prompt::Tasks(prompt)) => Some(prompt.cursor(width)),
             Some(Prompt::Lines(prompt)) => Some(prompt.cursor(width)),
             Some(Prompt::Timeline(prompt)) => Some(prompt.cursor(width)),
+            Some(Prompt::Queue(prompt)) => Some(prompt.cursor(width)),
+            Some(Prompt::Export(prompt)) => Some(prompt.cursor(width)),
             Some(Prompt::Models(prompt)) => Some(prompt.cursor(width)),
             Some(Prompt::Providers(prompt)) => Some(prompt.cursor(width, height)),
             Some(Prompt::Login(prompt)) => Some(prompt.cursor(width, height)),
@@ -4756,6 +4925,8 @@ impl App {
                         Some(Prompt::Timeline(prompt)) => {
                             Some(prompt.render(list_width, budget, p))
                         }
+                        Some(Prompt::Queue(prompt)) => Some(prompt.render(list_width, budget, p)),
+                        Some(Prompt::Export(prompt)) => Some(prompt.render(list_width, budget, p)),
                         Some(Prompt::Fork(prompt)) => Some(prompt.render(list_width, budget, p)),
                         Some(Prompt::Models(prompt)) => Some(prompt.render(list_width, budget, p)),
                         Some(Prompt::Providers(prompt)) => {
@@ -4804,6 +4975,8 @@ impl App {
                 Some(prompt.render(outer, panel_rows, p, &self.markdown))
             }
             Some(Prompt::Timeline(prompt)) => Some(prompt.render(outer, panel_rows, p)),
+            Some(Prompt::Queue(prompt)) => Some(prompt.render(outer, panel_rows, p)),
+            Some(Prompt::Export(prompt)) => Some(prompt.render(outer, panel_rows, p)),
             Some(Prompt::Fork(prompt)) => Some(prompt.render(outer, panel_rows, p)),
             Some(Prompt::Models(prompt)) => Some(prompt.render(outer, panel_rows, p)),
             Some(Prompt::Providers(prompt)) => Some(prompt.render(outer, panel_rows, p)),
@@ -5873,8 +6046,9 @@ const QUEUE_ROWS: usize = 5;
 
 /// The queue strip's hint, and its form when messages are not shown. Every
 /// `/name` it can draw is a command in the table.
-const QUEUE_HINT: &str = "shift+← edit last · ctrl+s steer now";
-const QUEUE_HINT_MORE: &str = "+{count} more · shift+← edit last · ctrl+s steer now";
+const QUEUE_HINT: &str = "/queue manage · shift+← edit last · ctrl+s steer now";
+const QUEUE_HINT_MORE: &str =
+    "+{count} more · /queue manage · shift+← edit last · ctrl+s steer now";
 
 /// The queue, drawn in a titled border above the composer: the next message
 /// to run reads at the top. `height` message rows are drawn (at least the
@@ -8531,16 +8705,13 @@ mod tests {
                         .take_while(|row| {
                             !row.contains("Callback URL") && !row.contains("Restart device login")
                         })
-                        .map(|row| {
-                            row.trim()
-                                .strip_prefix('│')
-                                .expect("the link keeps the left dialog border")
-                                .strip_suffix('│')
-                                .expect("the link keeps the right dialog border")
-                                .trim()
-                        })
+                        .map(|row| row.trim())
                         .collect::<Vec<_>>()
                         .join("\n");
+                    assert!(
+                        !selected.contains(['│', '|']),
+                        "Native selection must not include dialog borders: {selected}"
+                    );
                     if shortened && !mode.starts_with("device") {
                         let prefix = selected.replace('\n', "");
                         assert!(prefix.ends_with('…'));
@@ -9604,6 +9775,7 @@ mod tests {
         snapshot.focus = "main".into();
         drawn.app.apply(Update::Snapshot(Box::new(snapshot)));
         drawn.app.composer.clear();
+        let before = sent.borrow().len();
         let _ = drawn
             .app
             .handle(InputEvent::Key(crate::ui::terminal::KeyEvent::new(
@@ -9611,16 +9783,11 @@ mod tests {
                 Modifiers::SHIFT,
             )));
         assert!(drawn.app.composer.is_empty());
-        assert!(
-            matches!(sent.borrow().last(), Some(Command::InputControl { input_id, action: "withdraw" }) if input_id == "queued-image")
-        );
-        drawn.app.apply(Update::Withdrawn {
-            input_id: "queued-image".into(),
-        });
-        assert_eq!(drawn.app.composer.text(), "look [Image #7]");
-        drawn.key(KeyCode::Enter);
-        assert!(
-            matches!(sent.borrow().last(), Some(Command::Submit(text, _)) if text == "look [Image #7]")
+        assert_eq!(sent.borrow().len(), before);
+        assert!(drawn.app.notices.last().unwrap().contains("stay queued"));
+        assert_eq!(
+            drawn.app.snapshot.as_ref().unwrap().queued[0].id,
+            "queued-image"
         );
     }
 
@@ -10099,6 +10266,8 @@ mod tests {
                     id: (*id).into(),
                     text: (*text).into(),
                     display: None,
+                    held: true,
+                    recallable: true,
                 })
                 .collect(),
             ..ViewSnapshot::default()
@@ -10273,12 +10442,16 @@ mod tests {
             ["withdraw:a", "withdraw:b", "stop"]
         );
         assert!(app.composer.is_empty());
-        app.apply(Update::Withdrawn {
-            input_id: "a".into(),
-        });
-        app.apply(Update::Withdrawn {
-            input_id: "b".into(),
-        });
+        app.apply(Update::Withdrawn(dim_agent_types::UserInput {
+            content: vec![dim_agent_types::ContentBlock::Text {
+                text: "first".into(),
+            }],
+        }));
+        app.apply(Update::Withdrawn(dim_agent_types::UserInput {
+            content: vec![dim_agent_types::ContentBlock::Text {
+                text: "second".into(),
+            }],
+        }));
         assert_eq!(app.composer.text(), "first\nsecond");
     }
 
@@ -10293,9 +10466,11 @@ mod tests {
         )));
         assert_eq!(describe(&sent.borrow()), ["withdraw:b"]);
         assert!(app.composer.is_empty());
-        app.apply(Update::Withdrawn {
-            input_id: "b".into(),
-        });
+        app.apply(Update::Withdrawn(dim_agent_types::UserInput {
+            content: vec![dim_agent_types::ContentBlock::Text {
+                text: "second".into(),
+            }],
+        }));
         assert_eq!(app.composer.text(), "second");
     }
 
