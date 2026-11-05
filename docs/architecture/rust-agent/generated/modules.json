@@ -1577,7 +1577,8 @@
       "file": "crates/dim-agent-runtime/src/timeline_query.rs",
       "unexpandedMacros": [
         "format",
-        "matches"
+        "matches",
+        "vec"
       ]
     },
     {
@@ -8455,11 +8456,13 @@
       "from": "dim_agent_capabilities::context_methods",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
+        "path PredicateOp::Eq",
         "path TimelineQuery",
         "path TimelineQueryDirection::Ascending",
         "path TimelineQueryOrderBy::Sequence",
         "path TimelineQueryPredicate",
         "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::PredicateOp",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
@@ -8592,11 +8595,13 @@
       "from": "dim_agent_capabilities::context_policy",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
+        "path PredicateOp::Eq",
         "path TimelineQuery",
         "path TimelineQueryDirection::Ascending",
         "path TimelineQueryOrderBy::Sequence",
         "path TimelineQueryPredicate",
         "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::PredicateOp",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
@@ -9756,6 +9761,7 @@
       "from": "dim_agent_capabilities::history",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
+        "path PredicateOp::Eq",
         "path TimelineQuery",
         "path TimelineQueryDirection::Ascending",
         "path TimelineQueryDirection::Descending",
@@ -9765,6 +9771,7 @@
         "path TimelineQueryScope",
         "path TimelineQueryScope::Branch",
         "path TimelineQueryScope::Chain",
+        "use dim_agent_runtime::PredicateOp",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryFlag",
@@ -12150,6 +12157,14 @@
     },
     {
       "from": "dim_agent_capabilities::recall",
+      "to": "dim_agent_runtime::branch",
+      "references": [
+        "path Branch",
+        "use dim_agent_runtime::Branch"
+      ]
+    },
+    {
+      "from": "dim_agent_capabilities::recall",
       "to": "dim_agent_runtime::error",
       "references": [
         "path AgentError",
@@ -12186,11 +12201,17 @@
       "from": "dim_agent_capabilities::recall",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
+        "path TextMatch::All",
+        "path TextSearch",
         "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
         "path TimelineQueryDirection::Descending",
         "path TimelineQueryOrderBy::Sequence",
         "path TimelineQueryReply",
+        "path TimelineQueryScope::Branch",
         "path TimelineQueryScope::Chain",
+        "use dim_agent_runtime::TextMatch",
+        "use dim_agent_runtime::TextSearch",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
@@ -13544,6 +13565,7 @@
       "from": "dim_agent_capabilities::timeline_tree",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
+        "path PredicateOp::Eq",
         "path TimelineQuery",
         "path TimelineQueryDirection::Ascending",
         "path TimelineQueryDirection::Descending",
@@ -13553,6 +13575,7 @@
         "path TimelineQueryScope::Branch",
         "path dim_agent_runtime::TimelineQueryScope::Branch",
         "path rebuild_facts",
+        "use dim_agent_runtime::PredicateOp",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
@@ -26811,17 +26834,27 @@
       "from": "dim_app_server::storage::timeline",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
+        "path PredicateOp::Contains",
+        "path PredicateOp::Eq",
+        "path PredicateOp::Exists",
+        "path PredicateOp::In",
+        "path PredicateOp::Prefix",
         "path TimelineQuery",
         "path TimelineQueryDirection::Descending",
         "path TimelineQueryFlag",
         "path TimelineQueryFlag::Render",
         "path TimelineQueryFlag::State",
         "path TimelineQueryPage",
+        "path TimelineQueryPredicate",
         "path TimelineQueryScope::Branch",
+        "path dim_agent_runtime::TextMatch::All",
+        "path dim_agent_runtime::TextMatch::Any",
+        "use dim_agent_runtime::PredicateOp",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryFlag",
         "use dim_agent_runtime::TimelineQueryPage",
+        "use dim_agent_runtime::TimelineQueryPredicate",
         "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
@@ -40223,6 +40256,7 @@
       "from": "dim_goal::branch",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
+        "path PredicateOp::Eq",
         "path TimelineQuery",
         "path TimelineQueryDirection::Ascending",
         "path TimelineQueryDirection::Descending",
@@ -40231,6 +40265,7 @@
         "path TimelineQueryScope",
         "path TimelineQueryScope::Branch",
         "path rebuild_facts",
+        "use dim_agent_runtime::PredicateOp",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
