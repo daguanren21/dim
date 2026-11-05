@@ -8094,8 +8094,14 @@
       "from": "dim_agent_capabilities::agent_loop",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -8255,8 +8261,14 @@
       "from": "dim_agent_capabilities::approval",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -8723,8 +8735,8 @@
         "path chain_by_id",
         "path context_configuration",
         "path crate::history::FoldRead::timeline",
+        "path crate::history::HistoryRenderer::default",
         "path crate::history::project_batch",
-        "path crate::history::read_context",
         "use crate::history::HistoryRenderer",
         "use crate::history::chain_by_id",
         "use crate::history::context_configuration"
@@ -8843,8 +8855,14 @@
       "from": "dim_agent_capabilities::context_preparation",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -10116,8 +10134,14 @@
       "from": "dim_agent_capabilities::hooks::runner",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -10765,8 +10789,14 @@
       "from": "dim_agent_capabilities::input_queue",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -11019,8 +11049,14 @@
       "from": "dim_agent_capabilities::model_provider",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -11422,7 +11458,7 @@
       "from": "dim_agent_capabilities::prompt",
       "to": "dim_agent_capabilities::history",
       "references": [
-        "path crate::history::read_context"
+        "path crate::history::HistoryRenderer::default"
       ]
     },
     {
@@ -13552,14 +13588,12 @@
         "path TimelineQueryReply",
         "path TimelineQueryScope::Branch",
         "path dim_agent_runtime::TimelineQueryScope::Branch",
-        "path rebuild_facts",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
         "use dim_agent_runtime::TimelineQueryPredicate",
         "use dim_agent_runtime::TimelineQueryReply",
-        "use dim_agent_runtime::TimelineQueryScope",
-        "use dim_agent_runtime::rebuild_facts"
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -13713,7 +13747,7 @@
       "to": "dim_agent_capabilities::history",
       "references": [
         "path context_configuration",
-        "path crate::history::read_context",
+        "path crate::history::HistoryRenderer::default",
         "use crate::history::context_configuration"
       ]
     },
@@ -13901,8 +13935,14 @@
       "from": "dim_agent_capabilities::tool_executor",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -14435,8 +14475,14 @@
       "from": "dim_agent_capabilities::workspace_tools::background",
       "to": "dim_agent_runtime::timeline_query",
       "references": [
-        "path rebuild_facts",
-        "use dim_agent_runtime::rebuild_facts"
+        "path TimelineQuery",
+        "path TimelineQueryDirection::Ascending",
+        "path TimelineQueryOrderBy::Sequence",
+        "path TimelineQueryScope::Branch",
+        "use dim_agent_runtime::TimelineQuery",
+        "use dim_agent_runtime::TimelineQueryDirection",
+        "use dim_agent_runtime::TimelineQueryOrderBy",
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -19895,12 +19941,10 @@
         "path TimelineQueryDirection::Descending",
         "path TimelineQueryOrderBy::Sequence",
         "path TimelineQueryScope::Branch",
-        "path rebuild_facts",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
-        "use dim_agent_runtime::TimelineQueryScope",
-        "use dim_agent_runtime::rebuild_facts"
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
@@ -40230,13 +40274,11 @@
         "path TimelineQueryPredicate",
         "path TimelineQueryScope",
         "path TimelineQueryScope::Branch",
-        "path rebuild_facts",
         "use dim_agent_runtime::TimelineQuery",
         "use dim_agent_runtime::TimelineQueryDirection",
         "use dim_agent_runtime::TimelineQueryOrderBy",
         "use dim_agent_runtime::TimelineQueryPredicate",
-        "use dim_agent_runtime::TimelineQueryScope",
-        "use dim_agent_runtime::rebuild_facts"
+        "use dim_agent_runtime::TimelineQueryScope"
       ]
     },
     {
