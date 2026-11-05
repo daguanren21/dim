@@ -5,10 +5,10 @@ use crate::{
 };
 use dim_agent_runtime::{
     AgentError, Branch, BranchLifecycle, BranchOptions, Dispatcher, Names, Result, SessionIdentity,
-    StoredBranch, StoredEvent, Timeline, TimelineContext, TimelineFactory, TimelineIdentity,
-    TimelineInfo, TimelineKey, TimelineQuery, TimelineQueryDirection, TimelineQueryOrderBy,
-    TimelineQueryPredicate, TimelineQueryReply, TimelineQueryScope, TimelineStore,
-    TimelineTreeControl, rebuild_facts,
+    StoredBranch, StoredEvent, StoredKeyBlock, Timeline, TimelineContext, TimelineFactory,
+    TimelineIdentity, TimelineInfo, TimelineKey, TimelineQuery, TimelineQueryDirection,
+    TimelineQueryOrderBy, TimelineQueryPredicate, TimelineQueryReply, TimelineQueryScope,
+    TimelineStore, TimelineTreeControl, rebuild_facts,
 };
 use dim_agent_types::*;
 use futures_util::{FutureExt, future::join_all};
@@ -197,6 +197,19 @@ impl TreeCommands {
             .page(&id, after, limit, through)
             .await
     }
+    /// The live keyed raw blocks of line `id` at `through`.
+    pub async fn live_keys(
+        &self,
+        id: String,
+        through: u64,
+    ) -> std::result::Result<Vec<StoredKeyBlock>, AgentError> {
+        self.tree
+            .upgrade()
+            .ok_or_else(|| AgentError::Closed("TimelineTree".into()))?
+            .live_keys(&id, through)
+            .await
+    }
+
     /// Queries one line's own facts, forwarding to its Timeline while open
     /// and reading at the tree's fixed head after it ends. Chain scope is
     /// invalid; an ended line has no publishing tail.
@@ -879,6 +892,19 @@ impl TimelineTree {
             .into_iter()
             .map(|record| record.event)
             .collect())
+    }
+    async fn live_keys(&self, id: &str, through: u64) -> Result<Vec<StoredKeyBlock>> {
+        if let Some(context) = self.owned_context(id) {
+            return context.timeline().live_keys(through).await;
+        }
+        let through = self
+            .ended_head(id)
+            .ok_or_else(|| AgentError::UnknownBranch(id.into()))?;
+        let key = TimelineKey {
+            session_id: self.session_id.clone(),
+            branch_id: id.into(),
+        };
+        self.store.live_keys(&key, through).await
     }
     async fn query(&self, id: &str, query: TimelineQuery) -> Result<TimelineQueryReply> {
         query.validate()?;
