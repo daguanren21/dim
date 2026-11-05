@@ -416,6 +416,7 @@ impl TimelineContext {
                 flags: Vec::new(),
                 event_id: Some(input.id),
                 predicate: None,
+                predicates: Vec::new(),
                 limit: std::num::NonZeroU64::MIN,
                 offset: 0,
             })
@@ -445,6 +446,7 @@ impl TimelineContext {
                 flags: Vec::new(),
                 event_id: None,
                 predicate: None,
+                predicates: Vec::new(),
                 limit: std::num::NonZeroU64::MIN,
                 offset: 0,
             })

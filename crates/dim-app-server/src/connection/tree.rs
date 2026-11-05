@@ -493,6 +493,7 @@ async fn turn_window(
         flags: Vec::new(),
         event_id,
         predicate: None,
+        predicates: Vec::new(),
         limit: std::num::NonZeroU64::new(TURN_WINDOW_PAGE).expect("a page keeps one event"),
         offset: 0,
     };
@@ -671,6 +672,7 @@ async fn scan_keys(
                     flags: Vec::new(),
                     event_id: None,
                     predicate: None,
+                    predicates: Vec::new(),
                     limit: std::num::NonZeroU64::new(KEYS_PAGE).expect("a page keeps one event"),
                     offset: 0,
                 },
@@ -861,6 +863,7 @@ async fn window_events(
                 flags: Vec::new(),
                 event_id: None,
                 predicate: None,
+                predicates: Vec::new(),
                 limit: std::num::NonZeroU64::new(limit).expect("a page keeps one event"),
                 offset: 0,
             },

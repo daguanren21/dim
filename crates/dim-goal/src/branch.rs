@@ -448,6 +448,7 @@ impl Owner {
                     path: "source.operation_id".into(),
                     value: fold::evaluation_operation(after).into(),
                 }),
+                predicates: Vec::new(),
                 limit: NonZeroU64::new(1).expect("one fact is a page"),
                 ..read_page(TimelineQueryScope::Branch, Some(after), 1, true)
             })
@@ -959,6 +960,7 @@ fn read_page(
         flags: Vec::new(),
         event_id: None,
         predicate: None,
+        predicates: Vec::new(),
         limit: NonZeroU64::new(limit).expect("a page keeps at least one fact"),
         offset: 0,
     }
