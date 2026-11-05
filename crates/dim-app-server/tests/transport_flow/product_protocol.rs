@@ -934,8 +934,8 @@ async fn fixed_history_pages_share_live_projection_and_advance_across_filtered_r
         assert_ok(&created);
         let sid = created["result"]["sessionId"].as_str().unwrap();
         let session = agent.get_session(sid).unwrap();
-        let initial = session.sequence("main").unwrap();
         assert_ok(&client.rpc("session.attach", json!({"sessionId":sid})).await);
+        let initial = session.sequence("main").unwrap();
         assert_ok(
             &client
                 .rpc(
@@ -961,16 +961,6 @@ async fn fixed_history_pages_share_live_projection_and_advance_across_filtered_r
             .await;
         assert_ok(&first);
         let through = first["result"]["through"].as_u64().unwrap();
-        let expected: Vec<_> = client
-            .notices
-            .iter()
-            .filter(|notice| {
-                notice["method"] == "session.event"
-                    && notice["params"]["branchId"] == "main"
-                    && notice["params"]["event"]["sequence"].as_u64().unwrap() <= through
-            })
-            .map(|notice| notice["params"]["event"].clone())
-            .collect();
         let second = client
             .rpc(
                 "session.submit",
@@ -1015,6 +1005,17 @@ async fn fixed_history_pages_share_live_projection_and_advance_across_filtered_r
             "filtered pages must advance without visible events"
         );
         assert_eq!(page["nextAfter"], through);
+        let expected: Vec<_> = client
+            .notices
+            .iter()
+            .filter(|notice| {
+                notice["method"] == "session.event"
+                    && notice["params"]["branchId"] == "main"
+                    && notice["params"]["event"]["sequence"].as_u64().unwrap() > initial
+                    && notice["params"]["event"]["sequence"].as_u64().unwrap() <= through
+            })
+            .map(|notice| notice["params"]["event"].clone())
+            .collect();
         let live_part: Vec<_> = all
             .iter()
             .filter(|event| event["sequence"].as_u64().unwrap() > initial)
@@ -2606,7 +2607,16 @@ async fn model_progress_reaches_v3_subscribers_without_persisting() {
         other.notice("session.model.progress").await["params"],
         empty
     );
-    assert_eq!(session.sequence("main").unwrap(), head);
+    let appended = dim_agent_runtime::testing::branch_events(&session, "main", head + 1..)
+        .await
+        .unwrap();
+    assert!(
+        appended.iter().all(|event| {
+            matches!(&event.kind, EventKind::InputMessage(data) if data.user.is_none())
+                || matches!(event.kind, EventKind::InputApplied(_))
+        }),
+        "model progress does not persist facts: {appended:?}"
+    );
 
     let mut legacy = Client::new_version(&server, false, 2).await;
     let created = legacy.rpc("session.create", create(json!([]))).await;

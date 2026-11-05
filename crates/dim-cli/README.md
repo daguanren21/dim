@@ -14,10 +14,16 @@ writers for scripts. Development verification uses disposable user homes.
 only for that invocation. Source checks, stopped-source acknowledgement, progress,
 JSON reports, cancellation and exit codes follow the [migration command contract](../../docs/design/cli-commands.md#migration-interaction).
 
-`dimcode tui` opens the interactive client. `dimcode exec -p TEXT` runs one prompt
-and exits; redirected stdin supplies the prompt when `-p` is absent.
-`dimcode exec resume SESSION_ID -p TEXT` continues a persisted Session. Existing
-`--prompt`, piped stdin and `--resume` entries remain available.
+`dimcode tui` opens the interactive client. `dimcode tui -p TEXT` opens it and
+sends TEXT as its first message in both terminal modes, through the same
+composer a typed message uses; `--image PATH` is accepted with `tui` only
+together with `-p` and attaches to that message, and a message no Session can
+take stays in the composer as an unsent draft instead of being discarded.
+`dimcode tui --resume SESSION_ID -p TEXT` attaches to that Session and stays
+interactive. `dimcode exec -p TEXT` runs one prompt and exits; redirected stdin
+supplies the prompt when `-p` is absent. `dimcode exec resume SESSION_ID -p TEXT`
+continues a persisted Session. Existing piped stdin and `--resume` entries
+remain available.
 
 `dimcode acp [--agent ID]` mounts the reusable [ACP Gateway](../dim-acp/README.md)
 over stdin/stdout, using the same home, server and model-profile options. It has
@@ -249,6 +255,31 @@ settlement rule. Errors return to the prompt. `/exit` takes no arguments. Slash 
 in exec or redirected input remain literal model input.
 See [CLI commands and exports](../../docs/design/cli-commands.md).
 
+In either terminal UI, `/export` requires an opened Session and shows a dialog
+with just Markdown (.md) and JSON (.json). Up/Down chooses, Enter exports and
+Esc cancels without writing. The file is saved in the CLI current directory
+as `session-<unique-id>.md` or `.json`; success shows its absolute path and
+errors stay in the interface. The content matches `dimcode session export`'s
+fixed main-branch history. Existing files are never overwritten.
+
+`/queue` opens the shown line's unconsumed messages in either terminal mode.
+Up/Down selects a row; Enter steers a held message and `x` deletes it. Applied
+messages are labelled Incorporating and cannot be withdrawn; a raced operation
+reports that the input has already left the queue. Esc closes the panel.
+Shift+Left keeps messages with images or multiple content blocks queued with a
+notice rather than losing attachments. Esc interrupt withdraws every held message
+before stopping and restores its operator content, including images and stored
+paste/file links, after withdrawal succeeds. Appended runtime context is omitted
+so skill references load fresh context on resubmission; adjacent operator text
+blocks retain a newline separator. No held message starts another run.
+
+```text
+Queue
+  first request       Incorporating · awaiting model consumption
+› follow-up           Held · awaiting application
+Enter steer · x delete held · Esc close
+```
+
 At the idle interactive prompt, `/effort VALUE` (alias `/reasoning`) changes
 reasoning effort, `/fast on|off` selects priority/default service tiers, and
 `/agent ID` adopts an Agent profile's prompt and optional model. Tools and
@@ -355,10 +386,14 @@ conflicts with generated authentication fail without printing values. Credential
 and headers without direct mode are errors, not silently ignored inputs.
 
 `DIM_MAX_CONTEXT_TOKENS` and `DIM_MAX_OUTPUT_TOKENS` declare positive JS-safe
-integer capacities; output cannot exceed context. Empty or invalid startup
-inputs fail before Session creation. Overrides pass through `session.create` or,
-on resume, `session.model.update` before the first input. They do not write
-Provider records, defaults, daemon environment or secret configuration files.
+integer capacities; the request output allowance is derived from the pair, so a
+declared output may equal or exceed the declared context window. Empty or
+invalid startup inputs fail before Session creation. Overrides pass through
+`session.create` or, on resume, `session.model.update` before the first input.
+They do not write Provider records, defaults, daemon environment or secret
+configuration files.
+Interactive startup waits at Home without creating a Session; the first message
+uses these overrides. Exiting Home without sending leaves no saved Session.
 When launching a daemon for a parsed startup override, the CLI removes these
 startup `DIM_*` variables from that child environment; the running client keeps
 its parsed Session options and unrelated environment variables are unchanged.
@@ -1461,7 +1496,9 @@ dimcode --home /path/to/plugin-home daemon stop
 
 `dimcode web` holds the daemon's local web entry open, `/web` toggles the daemon-owned switch, and both serve the [Web workspace](../../docs/design/web-workspace.md) frontend, which is not inside the executable. `dimcode web --off` clears the switch without disconnecting a foreground holder. The CLI finds it, in this order, and names it to the daemon it starts: the directory in `DIMCODE_WEB_ASSETS` (the npm wrapper sets it to the installed optional dependency `dimcode-web`), `web/` beside the executable's `bin/` (the native archive `dimcode-web-VERSION.tar.gz` unpacked next to it), then `<home>/web`. `dimcode web install` downloads this version's `dimcode-web` from the npm registry (`DIMCODE_NPM_REGISTRY` names a mirror), checks it against the registry's integrity and puts it in `<home>/web`, which a running daemon started without another source serves from its next open; running it again after an upgrade installs the matching frontend, and it names a frontend in an earlier source that still comes first; a build the release flow did not produce has no published frontend, so it refuses before reading the registry. Without one, `dimcode web` (exit status 1) and `/web` say to run it, or, in a build the release flow did not produce, to point `DIMCODE_WEB_ASSETS` at a frontend built from the same source or build the App Server with the embedded-web feature; a daemon started before a frontend appeared in another source is restarted with `dimcode daemon stop`; a frontend recorded for another App Server protocol version (`web/dimcode-web.json`) is refused with `web_assets_incompatible`, and the CLI says how to provide a matching one.
 
-When the daemon keeps a UI registry (`ui.attach` in `hello`), the interface registers itself after every `session.attach` as `kind: tui`; a `ui.shutdown` notification for its id draws one last frame with the reason, then the interface exits 0 and the Session carries on. Any number of interfaces view one Session. When the daemon offers `ui.leaf.2`, interactive `dimcode` is itself a UI leaf (`crate::leaf`): it creates or resumes the Session, mounts `LeafNode` in its client tree (its `LocalId` `ui-<id>`, and a socket `ui-<8 hex>` in the private native home, as long as `daemon.sock`, that accepts one connection) and calls the internal `ui.open`; the daemon opens a rutis session with it and replies `{uiId, generation, token}`, and the process then runs its own `Tui` with this invocation's options, attaching with that token. The process ends when the `Tui` leaves (its exit code, or a restart) or when the session ends (exit 0); a `Tui` that fails to load ends it nonzero. rutis reports nothing to the terminal (the root's error sink writes nothing). A daemon without `ui.leaf.2` keeps the direct TUI. Initial product setup without a usable model also uses the existing direct TUI, so `/connect` and `/login` remain available before a Session exists; explicit model targets, `--model-config`, resume and other error codes keep their errors ([Tui §3.6](../../docs/design/plugins/Tui.md#36-ui-registry-and-ui-leaves)).
+Interactive `dimcode` starts at Home without creating a Session; the first message creates it. `--resume` attaches the requested Session at startup instead. Initial product setup, `/connect` and `/login` happen at Home without a Session, including when no usable model is configured.
+
+When the daemon keeps a UI registry (`ui.attach` in `hello`), the interface registers itself after every `session.attach` as `kind: tui`; a `ui.shutdown` notification for its id draws one last frame with the reason, then the interface exits 0 and the Session carries on. Any number of interfaces view one Session. When the daemon offers `ui.leaf.2`, interactive `dimcode` becomes a UI leaf (`crate::leaf`) on its first Session attachment: it mounts `LeafNode` in its client tree (its `LocalId` `ui-<id>`, and a socket `ui-<8 hex>` in the private native home, as long as `daemon.sock`, that accepts one connection) and calls the internal `ui.open`; the daemon opens a rutis session with it and replies `{uiId, generation, token}`, and the same `Tui` and RPC connection attach with that token. The process ends when the `Tui` leaves (its exit code, or a restart) or when the session ends (exit 0); a `Tui` that fails to load ends it nonzero. rutis reports nothing to the terminal (the root's error sink writes nothing). A daemon without `ui.leaf.2` keeps the direct TUI, with the same deferred Session creation. Explicit model targets, `--model-config`, resume and other error codes keep their errors ([Tui §3.6](../../docs/design/plugins/Tui.md#36-ui-registry-and-ui-leaves)).
 
 ## Home, transport and output
 

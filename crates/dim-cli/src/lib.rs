@@ -110,32 +110,43 @@ async fn daemon_link(
     Ok((link, connection))
 }
 
-/// Runs the ordinary TUI plugin directly, for an older daemon without the
-/// `ui.leaf.2` capability and for initial model setup. The caller
-/// owns the terminal; the daemon is only the protocol v3 business peer.
-async fn run_tui_with_connection(
+/// Starts the terminal interface at Home, or on the requested resumed
+/// Session, with the invocation's first message when it supplied one.
+async fn open_tui(
     root: &rutis::Ctx,
     options: &Options,
-    link: rutis::host::FiberView,
-    _connection: Arc<plugins::Connection>,
+    initial: Option<ui::Initial>,
 ) -> Result<i32> {
+    let (link, _connection) = daemon_link(root, options, true).await?;
     let env = ui::Env {
         home: options.home.clone(),
         workspace: options.workspace().as_str().to_owned(),
         fullscreen: options
             .fullscreen
             .unwrap_or_else(|| ui::config::saved_fullscreen(&options.home)),
+        initial,
     };
-    let (leave, left) = tokio::sync::oneshot::channel();
+    let (leave, mut left) = tokio::sync::oneshot::channel();
+    let (leaf_end, leaf_ended) = tokio::sync::oneshot::channel();
     let tui = root.plugin(plugins::Tui {
+        root: root.clone(),
         env,
         options: options.clone(),
         leave: std::sync::Mutex::new(Some(leave)),
+        leaf_end: std::sync::Mutex::new(Some(leaf_end)),
     });
     (&tui).await.map_err(plugin_error)?;
-    let leave = left
-        .await
-        .map_err(|_| "the terminal interface ended without a result")?;
+    let leave = tokio::select! {
+        leave = &mut left => leave,
+        ended = leaf_ended => {
+            if ended.is_ok() {
+                Ok(ui::tui::Leave::Exit(0))
+            } else {
+                left.await
+            }
+        }
+    }
+    .map_err(|_| "the terminal interface ended without a result")?;
     tui.dispose().await?;
     link.dispose().await?;
     match leave {
@@ -144,109 +155,12 @@ async fn run_tui_with_connection(
     }
 }
 
-/// The interactive entry on a daemon that keeps UI leaves (Tui design
-/// §3.6): this process creates or resumes the Session, mounts its leaf
-/// node, asks the daemon to open a session with it, then runs its own
-/// `Tui`. It ends when the `Tui` leaves or the session ends.
-async fn open_tui_leaf(root: &rutis::Ctx, options: &Options) -> Result<i32> {
-    let (link, connection) = daemon_link(root, options, true).await?;
-    if !connection.offers("ui.leaf.2") {
-        return run_tui_with_connection(root, options, link, connection).await;
-    }
-    let mut client = connection.take().ok_or("App Server did not start")?;
-    link.dispose().await?;
-    let session_id = if let Some(id) = &options.resume {
-        if let Some(preset) = options.permission {
-            permission::select(&mut client, id, preset)
-                .await
-                .map_err(|error| format!("Cannot set the permission preset: {error}"))?;
-        }
-        client
-            .rpc("session.attach", serde_json::json!({ "sessionId": id }))
-            .await?;
-        session_host::adopt_startup(&mut client, options, id).await?;
-        id.clone()
-    } else {
-        let params = session_create_from_options(&mut client, options).await?;
-        let preferences = params.get("modelPreferences").cloned();
-        let created: wire::Created = match client.typed("session.create", params).await {
-            Ok(created) => created,
-            Err(error)
-                if options.provider.is_none()
-                    && options.model_config.is_none()
-                    && options.startup.is_none()
-                    && client::app_error(&error) == Some("provider_failed") =>
-            {
-                drop(client);
-                let (link, connection) = daemon_link(root, options, false).await?;
-                return run_tui_with_connection(root, options, link, connection).await;
-            }
-            Err(error) => {
-                let error = model_adoption_error(
-                    &mut client,
-                    options.provider.as_deref().zip(options.model.as_deref()),
-                    error,
-                    preferences.as_ref().filter(|_| options.effort.is_none()),
-                )
-                .await;
-                return Err(format!(
-                    "Cannot create session: {error}. Configure a provider or use --model-config PATH with an API-key environment reference"
-                ).into());
-            }
-        };
-        client
-            .rpc(
-                "session.attach",
-                serde_json::json!({ "sessionId": created.session_id }),
-            )
-            .await?;
-        created.session_id
-    };
-
-    let leaf = leaf::Leaf::bind(options)?;
-    let params = serde_json::json!({
-        "sessionId": session_id,
-        "kind": "tui",
-        "peer": leaf.peer,
-        "address": leaf.address,
-    });
-    let (node, ended) = leaf.node();
-    let node = root.plugin(node);
-    (&node).await.map_err(plugin_error)?;
-    let opened = client.typed::<leaf::Opened>("ui.open", params).await;
-    drop(client);
-    let opened = match opened {
-        Ok(opened) => opened,
-        Err(error) => {
-            node.dispose().await?;
-            return Err(error);
-        }
-    };
-    let (leave, left) = tokio::sync::oneshot::channel();
-    let tui = root.plugin(leaf::LeafTui::new(options, session_id, opened, leave));
-    if let Err(error) = (&tui).await {
-        let _ = tui.dispose().await;
-        node.dispose().await?;
-        return Err(plugin_error(error));
-    }
-    let leave = tokio::select! {
-        leave = left => leave.ok(),
-        _ = ended => None,
-    };
-    tui.dispose().await?;
-    node.dispose().await?;
-    match leave {
-        Some(ui::tui::Leave::Exit(code)) => Ok(code),
-        Some(ui::tui::Leave::Restart(restart)) => relaunch(root, options, restart).await,
-        None => Ok(0),
-    }
-}
-
 /// Starts the updated CLI on the session the interface left. The daemon
 /// still runs the old executable, so it stops first and the new CLI starts
 /// its own. The original arguments carry over except the interface mode,
-/// which follows the one in use, and the session, which is the one left;
-/// a resumed session keeps its model, so the model flags drop with it.
+/// which follows the one in use, the session, which is the one left, and
+/// the first message (`--prompt` with its `--image`), which was already
+/// sent; a resumed session keeps its model, so the model flags drop with it.
 async fn relaunch(root: &rutis::Ctx, options: &Options, restart: ui::tui::Restart) -> Result<i32> {
     let (link, connection) = daemon_link(root, options, false).await?;
     if let Some(client) = connection.take() {
@@ -259,7 +173,7 @@ async fn relaunch(root: &rutis::Ctx, options: &Options, restart: ui::tui::Restar
         let resumed = restart.session_id.is_some();
         match arg.to_str() {
             Some("--fullscreen" | "--scrollback") => {}
-            Some("--resume") => {
+            Some("--resume" | "--prompt" | "-p" | "--image") => {
                 original.next();
             }
             Some("--provider" | "--model") if resumed => {
@@ -585,16 +499,24 @@ async fn act(root: &rutis::Ctx, mut options: Options) -> Result<i32> {
     if let Action::Acp { agent_id, .. } = &options.action {
         return run_acp(root, &options, agent_id.clone()).await;
     }
-    if matches!(options.action, Action::Chat | Action::Tui)
-        && options.prompt.is_none()
-        && !options.no_tui
-        && ui::tui::is_interactive()
-    {
+    let starts_tui = match options.action {
+        Action::Tui => true,
+        Action::Chat => options.prompt.is_none(),
+        _ => false,
+    };
+    if starts_tui && !options.no_tui && ui::tui::is_interactive() {
         if options.permission.is_none() {
             options.permission = ui::config::saved_permission(&options.home)
                 .and_then(|preset| permission::parse_preset(&preset).ok());
         }
-        return open_tui_leaf(root, &options).await;
+        let initial = match (&options.action, &options.prompt) {
+            (Action::Tui, Some(text)) => Some(ui::Initial {
+                text: text.clone(),
+                images: images::load(&options.images)?.images,
+            }),
+            _ => None,
+        };
+        return open_tui(root, &options, initial).await;
     }
     if matches!(options.action, Action::WebInstall) {
         if !version::RELEASE {
@@ -650,6 +572,13 @@ async fn act(root: &rutis::Ctx, mut options: Options) -> Result<i32> {
             output,
         } => {
             export::write(&mut client, session_id, *format, output.as_deref()).await?;
+            if let Some(path) = output {
+                eprintln!(
+                    "Exported {}: {}",
+                    format.label(),
+                    sanitize::safe(&path.display().to_string())
+                );
+            }
             Ok(0)
         }
         Action::SessionRename {
@@ -872,7 +801,8 @@ async fn act(root: &rutis::Ctx, mut options: Options) -> Result<i32> {
         }
         Action::Recording { enabled } => recording::run(&mut client, &options, *enabled).await,
         Action::Chat | Action::Tui | Action::Exec => {
-            session::chat(&mut client, &options, images.blocks, images.notes).await
+            let blocks = images.images.iter().map(|image| image.block()).collect();
+            session::chat(&mut client, &options, blocks, images.notes).await
         }
         Action::Acp { .. }
         | Action::Migration(_)

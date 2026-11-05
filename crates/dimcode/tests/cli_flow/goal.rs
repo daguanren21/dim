@@ -445,7 +445,6 @@ fn tui_goal_shows_the_state_and_marks_the_status_area() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["session.methods"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let table = wire.read("session.methods");
@@ -497,7 +496,7 @@ fn tui_goal_shows_the_state_and_marks_the_status_area() {
     let mut command = home.command();
     command.arg("--scrollback");
     sized(&mut command, 100, 32);
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("⏵⏵ Workspace write");
     terminal.until("test / model");
 
@@ -539,7 +538,6 @@ fn tui_goal_acts_on_the_shown_line_and_a_new_line_has_none() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["session.methods"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let table = wire.read("session.methods");
@@ -606,7 +604,7 @@ fn tui_goal_acts_on_the_shown_line_and_a_new_line_has_none() {
     });
     let mut command = home.command();
     sized(&mut command, 100, 32);
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
 
     terminal.write(b"/goal Ship it\r");
@@ -641,7 +639,6 @@ fn tui_goal_reads_the_line_before_it_picks_set_or_edit() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["session.methods"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let table = wire.read("session.methods");
@@ -692,7 +689,7 @@ fn tui_goal_reads_the_line_before_it_picks_set_or_edit() {
     });
     let mut command = home.command();
     sized(&mut command, 100, 32);
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
 
     terminal.write(b"/lines\r");
@@ -723,7 +720,6 @@ fn tui_goal_reports_a_failed_read_and_sends_nothing() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["session.methods"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let table = wire.read("session.methods");
@@ -759,7 +755,7 @@ fn tui_goal_reports_a_failed_read_and_sends_nothing() {
     });
     let mut command = home.command();
     sized(&mut command, 100, 32);
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
 
     terminal.write(b"/lines\r");
@@ -793,7 +789,6 @@ fn tui_goal_during_the_initial_history_read_opens_no_second_pager() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["session.methods"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let table = wire.read("session.methods");
@@ -840,7 +835,7 @@ fn tui_goal_during_the_initial_history_read_opens_no_second_pager() {
     });
     let mut command = home.command();
     sized(&mut command, 100, 32);
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
 
     terminal.write(b"/goal New objective\r");
@@ -1062,10 +1057,30 @@ fn the_product_profile_installs_native_goal_without_a_foreign_runtime() {
         );
         thread::sleep(Duration::from_millis(5));
     };
-    assert_eq!(
-        settings["result"]["document"]["maxContinuations"], 20,
-        "{settings}"
+    assert_eq!(settings["result"]["document"], json!({}), "{settings}");
+    let revision = settings["result"]["revision"]
+        .as_str()
+        .expect("the settings revision")
+        .to_owned();
+    let updated = rpc(
+        &mut wire,
+        &mut id,
+        "settings.update",
+        json!({"source":"goal","scope":"user","expectedRevision":revision,
+            "document":{"maxContinuations":5}}),
     );
+    assert_eq!(
+        updated["result"]["document"]["maxContinuations"], 5,
+        "{updated}"
+    );
+    let cleared = rpc(
+        &mut wire,
+        &mut id,
+        "settings.update",
+        json!({"source":"goal","scope":"user",
+            "expectedRevision":updated["result"]["revision"],"document":{}}),
+    );
+    assert_eq!(cleared["result"]["document"], json!({}), "{cleared}");
 
     let provider = "018ec73f-0000-7000-8000-000000000097";
     let configured = rpc(
@@ -1192,11 +1207,7 @@ fn the_product_profile_installs_native_goal_without_a_foreign_runtime() {
         "a completed goal asks for no further turn: {seen:#?}"
     );
     assert!(
-        said(
-            &seen[1],
-            "user",
-            r#"kind="continuation" count="1" limit="20""#
-        ),
+        said(&seen[1], "user", r#"kind="continuation" count="1""#),
         "the continuation reaches the model: {:#?}",
         seen[1]
     );
@@ -1232,7 +1243,7 @@ fn the_product_profile_installs_native_goal_without_a_foreign_runtime() {
         .find(|text| text.contains(r#"kind="continuation""#))
         .expect("the completed turn writes a continuation");
     assert!(
-        continuation.starts_with(r#"<dim-goal kind="continuation" count="1" limit="20" after=""#)
+        continuation.starts_with(r#"<dim-goal kind="continuation" count="1" after=""#)
             && continuation.contains(r#"branch="main">"#),
         "{continuation}"
     );

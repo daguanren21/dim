@@ -161,10 +161,11 @@ async fn node_session_part_calls_provider_auxiliary_model_without_timeline_write
         "invalid calls must not reach the model"
     );
     let after = chain_events(&session, "main", ..).await.unwrap();
-    assert_eq!(
-        before.iter().map(|event| &event.id).collect::<Vec<_>>(),
-        after.iter().map(|event| &event.id).collect::<Vec<_>>()
-    );
+    assert!(after.starts_with(&before));
+    assert!(after[before.len()..].iter().all(|event| {
+        matches!(&event.kind, EventKind::InputMessage(data) if data.user.is_none() && data.effective_mode() == dim_agent_types::InputMode::Append)
+            || matches!(&event.kind, EventKind::InputApplied(data) if data.mode == Some(dim_agent_types::InputMode::Append))
+    }), "auxiliary calls append no business facts: {after:?}");
     let pending = client
         .send(
             "session.auxiliary.complete",
@@ -401,14 +402,6 @@ async fn node_session_typescript_broadcast_isolation_fences_and_cleanup() {
     let (session_instance, ctx, _, _) = controls.recv().await.unwrap();
     let second = new_session(&mut client, json!(["echo"])).await;
     let first_session = server.agent().unwrap().get_session(&first).unwrap();
-    let first_after = first_session.sequence("main").unwrap();
-    let second_after = server
-        .agent()
-        .unwrap()
-        .get_session(&second)
-        .unwrap()
-        .sequence("main")
-        .unwrap();
     let initial = when_served(
         &mut client,
         "session.observer.status",
@@ -416,16 +409,41 @@ async fn node_session_typescript_broadcast_isolation_fences_and_cleanup() {
     )
     .await;
     assert_ok(&initial);
-    let loading: Vec<Value> = branch_events(&first_session, "main", ..=first_after)
+    assert_ok(
+        &when_served(
+            &mut client,
+            "session.second.status",
+            json!({"sessionId":first}),
+        )
+        .await,
+    );
+    let first_after = first_session.sequence("main").unwrap();
+    assert_ok(
+        &when_served(
+            &mut client,
+            "session.observer.status",
+            json!({"sessionId":second}),
+        )
+        .await,
+    );
+    let second_after = server
+        .agent()
+        .unwrap()
+        .get_session(&second)
+        .unwrap()
+        .sequence("main")
+        .unwrap();
+    let initial_records = initial["result"]["records"].as_array().unwrap();
+    let initial_through = initial_records
+        .last()
+        .map_or(0, |record| record["event"]["sequence"].as_u64().unwrap());
+    let loading: Vec<Value> = branch_events(&first_session, "main", ..=initial_through)
         .await
         .unwrap()
         .iter()
         .map(|event| json!({"sessionId":first,"branchId":"main","event":event}))
         .collect();
-    assert!(
-        loading.ends_with(initial["result"]["records"].as_array().unwrap()),
-        "{initial}"
-    );
+    assert!(loading.ends_with(initial_records), "{initial}");
     assert_eq!(initial["result"]["binding"]["sessionId"], first);
     assert!(
         initial["result"]["binding"]["config"]
@@ -503,7 +521,21 @@ async fn node_session_typescript_broadcast_isolation_fences_and_cleanup() {
             .await,
     );
     let through = first_session.sequence("main").unwrap();
-    let expected: Vec<Value> = branch_events(&first_session, "main", first_after + 1..)
+    let child = first_session
+        .branch(
+            "main".into(),
+            through,
+            dim_agent_runtime::BranchOptions {
+                prompt: "child branch observation".into(),
+                source: dim_agent_types::BranchSource::Host {
+                    operation_id: "observation".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    first_session.idle(&child).await.unwrap();
+    let expected: Vec<Value> = branch_events(&first_session, "main", first_after + 1..=through)
         .await
         .unwrap()
         .iter()
@@ -519,41 +551,23 @@ async fn node_session_typescript_broadcast_isolation_fences_and_cleanup() {
         assert_ok(&observed);
         assert_eq!(observed["result"]["records"], json!(expected));
     }
-    let child = first_session
-        .branch(
-            "main".into(),
-            through,
-            dim_agent_runtime::BranchOptions {
-                prompt: "child branch observation".into(),
-                source: dim_agent_types::BranchSource::Host {
-                    operation_id: "observation".into(),
-                },
-            },
-        )
+    let child_through = first_session.sequence(&child).unwrap();
+    let child_history = branch_events(&first_session, &child, ..=child_through)
         .await
         .unwrap();
-    first_session.idle(&child).await.unwrap();
-    let child_history = branch_events(&first_session, &child, ..).await.unwrap();
     let child_records = client
         .rpc(
             "session.observer.through",
             json!({"sessionId":first,
-        "branchId":child,"sequence":first_session.sequence(&child).unwrap()}),
+        "branchId":child,"sequence":child_through}),
         )
         .await;
     assert_ok(&child_records);
-    let actual_child: Vec<_> = child_records["result"]["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|record| record["branchId"] == child)
-        .cloned()
-        .collect();
     let expected_child: Vec<_> = child_history
         .iter()
         .map(|event| json!({"sessionId":first,"branchId":child,"event":event}))
         .collect();
-    assert_eq!(actual_child, expected_child);
+    assert_eq!(child_records["result"]["records"], json!(expected_child));
     let view = session_copy(
         &ctx,
         session_instance,
@@ -664,17 +678,18 @@ async fn node_session_typescript_broadcast_isolation_fences_and_cleanup() {
         other["result"]["generation"]
     );
     let restored_session = server.agent().unwrap().get_session(&second).unwrap();
-    let restoring: Vec<Value> = branch_events(&restored_session, "main", ..)
+    let restored_records = restored["result"]["records"].as_array().unwrap();
+    let restored_through = restored_records
+        .last()
+        .map_or(0, |record| record["event"]["sequence"].as_u64().unwrap());
+    submit(&mut client, &second, "restored channel receives new facts").await;
+    let restoring: Vec<Value> = branch_events(&restored_session, "main", ..=restored_through)
         .await
         .unwrap()
         .iter()
         .map(|event| json!({"sessionId":second,"branchId":"main","event":event}))
         .collect();
-    assert!(
-        restoring.ends_with(restored["result"]["records"].as_array().unwrap()),
-        "{restored}"
-    );
-    submit(&mut client, &second, "restored channel receives new facts").await;
+    assert!(restoring.ends_with(restored_records), "{restored}");
     let current = server.agent().unwrap().get_session(&second).unwrap();
     assert_ok(
         &client
@@ -762,7 +777,7 @@ async fn node_session_row_hold_lasts_until_released_or_its_row_unloads() {
         call(&mut client, "session.observer.release_session", release).await,
         json!(false)
     );
-    assert!(session.unload_if_idle().await.unwrap());
+    super::collaboration::unload(&server.agent().unwrap(), &id).await;
 
     let id = new_session(&mut client, json!(["echo"])).await;
     let (session_instance, ctx, _, _) = controls.recv().await.unwrap();
@@ -791,7 +806,7 @@ async fn node_session_row_hold_lasts_until_released_or_its_row_unloads() {
         call(&mut client, "session.observer.release_session", release).await,
         json!(false)
     );
-    assert!(session.unload_if_idle().await.unwrap());
+    super::collaboration::unload(&server.agent().unwrap(), &id).await;
     drop(client);
     server.shutdown();
     server.join().await.unwrap();
@@ -839,7 +854,6 @@ async fn node_session_typescript_observes_a_session_across_idle_unloads() {
         assert_ok(&client.rpc("session.attach", attach.clone()).await);
         assert_eq!(loads.of(&id), (round + 1, round == 1));
         let session = server.agent().unwrap().get_session(&id).unwrap();
-        let after = session.sequence("main").unwrap();
         let status = when_served(
             &mut client,
             "session.observer.status",
@@ -847,9 +861,18 @@ async fn node_session_typescript_observes_a_session_across_idle_unloads() {
         )
         .await;
         assert_ok(&status);
+        assert_ok(
+            &when_served(
+                &mut client,
+                "session.second.status",
+                json!({"sessionId":id}),
+            )
+            .await,
+        );
+        let after = session.sequence("main").unwrap();
         submit(&mut client, &id, text).await;
         let through = session.sequence("main").unwrap();
-        let expected: Vec<Value> = branch_events(&session, "main", after + 1..)
+        let expected: Vec<Value> = branch_events(&session, "main", after + 1..=through)
             .await
             .unwrap()
             .iter()
@@ -1088,7 +1111,7 @@ impl ModelDriver for CheckedModel {
             .cloned()
             .collect();
         let _ = self.tools.send(tools);
-        let batch = request.messages.last().is_some_and(|message| {
+        let batch = EchoModel::last_message(&request).is_some_and(|message| {
             message.role == Role::User
                 && match &message.content {
                     MessageContent::Text(text) => text == "batch",
@@ -1269,18 +1292,20 @@ pub(super) async fn plugin_active(server: &RunningServer, row: &Value) {
 /// The reply of `method` once the optional row that serves it has registered
 /// it: a Session is published without waiting for its optional rows, and a
 /// namespace is `unknown_method` until its row registers it.
+/// The availability deadline does not cancel an admitted call.
 pub(super) async fn when_served(client: &mut Client, method: &str, params: Value) -> Value {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let reply = client.rpc(method, params.clone()).await;
-            if !waiting(&reply) {
-                return reply;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = client.rpc(method, params.clone()).await;
+        if !waiting(&reply) {
+            return reply;
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{method} is served"))
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{method} is served: {reply}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Reconciles the loader's layers with a fixture layer `name` of
