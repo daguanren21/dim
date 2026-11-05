@@ -2211,6 +2211,7 @@
         "matches",
         "tokio::pin",
         "tokio::select",
+        "unreachable",
         "vec"
       ]
     },
@@ -22001,6 +22002,7 @@
         "mod publication",
         "path McpApplication",
         "path McpOwner",
+        "path Publication",
         "path publication",
         "path publication::Publication",
         "use publication::McpApplication",
@@ -22349,6 +22351,7 @@
       "from": "dim_app_server::mcp::management",
       "to": "dim_agent_capabilities::methods",
       "references": [
+        "path Interruption::Drain",
         "path Interruption::Report",
         "path MethodDecl::new",
         "path RpcError",
@@ -22614,6 +22617,8 @@
         "path Result",
         "path daemon_environment",
         "path sources_in_precedence",
+        "path super::ProjectRevisions",
+        "path super::ProjectRevisions::default",
         "use super::McpConnection",
         "use super::McpError",
         "use super::McpSource",

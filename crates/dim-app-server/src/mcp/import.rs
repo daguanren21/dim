@@ -245,7 +245,9 @@ fn entry_preview(
         },
         None => None,
     };
-    preview.status = if target.invalid_error(id).is_some() {
+    preview.status = if target.invalid_error(id).is_some()
+        || (existing.is_none() && project && overlays.contains_key(id))
+    {
         ImportStatus::Conflict
     } else {
         match &existing {
@@ -350,16 +352,19 @@ pub(crate) fn plan(
                         "the target source holds this id with a different configuration; replace or rename it",
                     ));
                 }
-                if target.invalid_error(id).is_some() {
+                if target.invalid_error(id).is_some() || (project && overlays.contains_key(id)) {
                     return Err(import_conflict(
                         id,
-                        "the target source holds this id as an entry that does not decode; replace or rename it",
+                        "the target source holds this id as an invalid entry or a withheld record; replace or rename it",
                     ));
                 }
                 id.clone()
             }
             ImportAction::Replace => {
-                if target.get(id).is_none() && target.invalid_error(id).is_none() {
+                if target.get(id).is_none()
+                    && target.invalid_error(id).is_none()
+                    && !(project && overlays.contains_key(id))
+                {
                     return Err(import_conflict(
                         id,
                         "the target source does not hold this id",
@@ -377,6 +382,7 @@ pub(crate) fn plan(
                 if target.contains(new_id)
                     || target.invalid_error(new_id).is_some()
                     || planned.contains_key(new_id)
+                    || (project && overlays.contains_key(new_id))
                 {
                     return Err(import_conflict(id, "the new id is already taken"));
                 }

@@ -287,6 +287,8 @@ impl McpProbe {
 
 /// Source CAS tokens are distinct from connection and tool-source versions.
 /// Sources are read independently, not in a cross-source transaction.
+/// Project tokens bind the project document and the user-local overlay snapshot.
+/// They are opaque owner-generation tokens, not Settings file revisions.
 pub struct McpCatalog {
     pub user_revision: String,
     pub project_revision: Option<String>,
@@ -444,6 +446,60 @@ fn resolved_entry(
     })
 }
 
+#[derive(Default)]
+struct ProjectRevisions(Mutex<BTreeMap<usize, ProjectSnapshots>>);
+
+#[derive(Default)]
+struct ProjectSnapshots {
+    current: Option<ProjectRevision>,
+    applied: Option<ProjectRevision>,
+}
+
+#[derive(Clone)]
+struct ProjectRevision {
+    source: String,
+    overlays: String,
+    token: String,
+}
+
+impl ProjectRevisions {
+    fn token(&self, project: usize, source: &str, overlays: &str) -> String {
+        self.select(project, source, overlays, false)
+    }
+
+    fn applied_token(&self, project: usize, source: &str, overlays: &str) -> String {
+        self.select(project, source, overlays, true)
+    }
+
+    fn select(&self, project: usize, source: &str, overlays: &str, applied: bool) -> String {
+        let mut revisions = self.0.lock().unwrap();
+        let snapshots = revisions.entry(project).or_default();
+        let (selected, other) = if applied {
+            (&mut snapshots.applied, &snapshots.current)
+        } else {
+            (&mut snapshots.current, &snapshots.applied)
+        };
+        let matches = |revision: &&ProjectRevision| {
+            revision.source == source && revision.overlays == overlays
+        };
+        if let Some(revision) = selected.as_ref().filter(matches) {
+            return revision.token.clone();
+        }
+        let revision = other
+            .as_ref()
+            .filter(matches)
+            .cloned()
+            .unwrap_or_else(|| ProjectRevision {
+                source: source.to_owned(),
+                overlays: overlays.to_owned(),
+                token: uuid::Uuid::new_v4().to_string(),
+            });
+        let token = revision.token.clone();
+        *selected = Some(revision);
+        token
+    }
+}
+
 pub struct McpService {
     settings: Arc<SettingsService>,
     credentials: Arc<dyn CredentialVariables>,
@@ -452,6 +508,7 @@ pub struct McpService {
     publication: Arc<publication::Publication>,
     stopping: CancellationToken,
     gate: Mutex<()>,
+    mutations: Arc<tokio::sync::Mutex<()>>,
     tasks: TaskTracker,
 }
 impl McpService {
@@ -642,6 +699,7 @@ impl McpService {
     ) -> Result<McpCatalog> {
         self.publication.refresh();
         let credentials = self.credentials.clone();
+        let revisions = self.publication.revisions.clone();
         self.run(cancel, move |settings, cancel| async move {
             let protected = credentials.credential_variables();
             let mut catalog = McpCatalog {
@@ -659,14 +717,14 @@ impl McpService {
                     .unwrap_or_default(),
                 None => McpProjectEnablement::default(),
             };
-            let secrets = match project {
+            let (secrets, secrets_revision) = match project {
                 Some(_) => {
-                    settings
+                    let snapshot = settings
                         .read::<McpSecrets>(SettingsScope::User, &cancel)
-                        .await?
-                        .document
+                        .await?;
+                    (snapshot.document, snapshot.revision)
                 }
-                None => McpSecrets::default(),
+                None => (McpSecrets::default(), String::new()),
             };
             for source in sources_in_precedence(project) {
                 let Some(scope) = source.scope() else {
@@ -699,8 +757,9 @@ impl McpService {
                 let snapshot = settings.read::<McpSettings>(scope, &cancel).await?;
                 match scope {
                     SettingsScope::User => catalog.user_revision = snapshot.revision,
-                    SettingsScope::Project(_) => {
-                        catalog.project_revision = Some(snapshot.revision);
+                    SettingsScope::Project(root) => {
+                        catalog.project_revision =
+                            Some(revisions.token(root, &snapshot.revision, &secrets_revision));
                     }
                 }
                 let document = snapshot.document;
@@ -814,6 +873,7 @@ impl McpService {
             return Err(McpError::InvalidId);
         }
         let protected = self.protected();
+        let revisions = self.publication.revisions.clone();
         self.run(cancel, move |settings, cancel| async move {
             let Some(scope) = source.scope() else {
                 let configuration = match settings
@@ -849,14 +909,14 @@ impl McpService {
                     secret: None,
                 });
             };
-            let snapshot = settings.read::<McpSettings>(scope, &cancel).await?;
+            let mut snapshot = source_snapshot(&settings, &revisions, scope, &cancel).await?;
             let Some(mut configuration) = snapshot.document.get(&id).cloned() else {
                 return match snapshot.document.invalid_error(&id) {
                     Some(error) => Err(McpError::InvalidEntry(error.clone())),
                     None => Err(McpError::UnknownServer),
                 };
             };
-            let secret = secret(&settings, scope, &id, &cancel).await?;
+            let secret = snapshot.overlays.remove(&id);
             if let Some(secret) = &secret {
                 config::merge_secret(&mut configuration, secret)?;
             }
@@ -930,7 +990,7 @@ impl McpService {
         if id.trim().is_empty() {
             return Err(McpError::InvalidId);
         }
-        self.run(cancel, move |settings, cancel| async move {
+        self.mutate(cancel, move |settings, cancel| async move {
             let workspace = config::workspace(&settings, source)?;
             remove_secret_if(&settings, &workspace, &id, &generation, &cancel).await
         })
@@ -1035,8 +1095,8 @@ impl McpService {
     /// Returns the revision of `source` after the change.
     ///
     /// A project entry's enablement is the user's record (ADR 003 D3), never
-    /// project files. Enabling checks `expected` against the project source and
-    /// that the entry exists there. A disable withdraws the record without
+    /// project files. Enabling checks `expected` against the project document
+    /// and overlay snapshot and that the entry exists there. A disable withdraws the record without
     /// depending on the project file, so an entry the user turned off stays off
     /// even if the file is unreadable. A remove needs a readable source, and a
     /// remove whose `expectedVersion` is stale when it arrives writes nothing.
@@ -1060,27 +1120,32 @@ impl McpService {
         }
         let withdraws = matches!(change, McpChange::SetEnabled(false) | McpChange::Remove);
         let publication = self.publication.clone();
-        let cleanup_id = id.clone();
-        let written = self
-            .run(cancel, move |settings, cancel| async move {
-                write(&settings, source, expected, id, change, &cancel).await
-            })
-            .await?;
-        if let Some(captured) = written.captured {
-            self.clear_secret_if(source, cleanup_id, captured, cancel)
-                .await?;
-        }
-        if written.entry_absent {
-            return Err(McpError::UnknownServer);
-        }
-        if withdraws {
-            let _ = self
-                .run(cancel, move |_, cancel| async move {
-                    publication.settle(&cancel).await
-                })
-                .await;
-        }
-        Ok(written.revision)
+        let revisions = self.publication.revisions.clone();
+        self.mutate(cancel, move |settings, cancel| async move {
+            let result = async {
+                let cleanup_id = id.clone();
+                let mut written =
+                    write(&settings, &revisions, source, expected, id, change, &cancel).await?;
+                if let Some(captured) = written.captured {
+                    let workspace = config::workspace(&settings, source)?;
+                    remove_secret_if(&settings, &workspace, &cleanup_id, &captured, &cancel)
+                        .await?;
+                    written.revision = source_snapshot(&settings, &revisions, source, &cancel)
+                        .await?
+                        .revision;
+                }
+                if written.entry_absent {
+                    return Err(McpError::UnknownServer);
+                }
+                Ok(written.revision)
+            }
+            .await;
+            if withdraws {
+                let _ = publication.settle(&cancel).await;
+            }
+            result
+        })
+        .await
     }
 
     /// Previews importing one `mcpServers` document into one source. The
@@ -1091,14 +1156,14 @@ impl McpService {
         document: McpSettings,
         cancel: &CancellationToken,
     ) -> Result<import::ImportPreview> {
+        let revisions = self.publication.revisions.clone();
         self.run(cancel, move |settings, cancel| async move {
-            let snapshot = settings.read::<McpSettings>(source, &cancel).await?;
-            let overlays = overlays(&settings, source, &cancel).await?;
+            let snapshot = source_snapshot(&settings, &revisions, source, &cancel).await?;
             Ok(import::preview(
                 &document,
                 &snapshot.document,
                 matches!(source, SettingsScope::Project(_)),
-                &overlays,
+                &snapshot.overlays,
                 &snapshot.revision,
             ))
         })
@@ -1117,8 +1182,22 @@ impl McpService {
         resolutions: BTreeMap<String, import::ImportResolution>,
         cancel: &CancellationToken,
     ) -> Result<String> {
-        self.run(cancel, move |settings, cancel| async move {
-            write_import(&settings, source, expected, document, resolutions, &cancel).await
+        let publication = self.publication.clone();
+        let revisions = self.publication.revisions.clone();
+        self.mutate(cancel, move |settings, cancel| async move {
+            let result = write_import(
+                &settings,
+                &publication,
+                &revisions,
+                source,
+                expected,
+                document,
+                resolutions,
+                &cancel,
+            )
+            .await;
+            let _ = publication.settle(&cancel).await;
+            result
         })
         .await
     }
@@ -1150,9 +1229,10 @@ impl McpService {
             )));
         }
         let into_project = matches!(to_scope, SettingsScope::Project(_));
-        self.run(cancel, move |settings, cancel| async move {
-            let from_snapshot = settings.read::<McpSettings>(from_scope, &cancel).await?;
-            let to_snapshot = settings.read::<McpSettings>(to_scope, &cancel).await?;
+        let revisions = self.publication.revisions.clone();
+        self.mutate(cancel, move |settings, cancel| async move {
+            let from_snapshot = source_snapshot(&settings, &revisions, from_scope, &cancel).await?;
+            let to_snapshot = source_snapshot(&settings, &revisions, to_scope, &cancel).await?;
             if from_snapshot.revision != expected_from || to_snapshot.revision != expected_to {
                 return Err(SettingsError::Conflict.into());
             }
@@ -1167,8 +1247,8 @@ impl McpService {
                     None => Err(McpError::UnknownServer),
                 };
             };
-            let from_secret = secret(&settings, from_scope, &id, &cancel).await?;
-            if let Some(secret) = &from_secret {
+            let from_secret = from_snapshot.overlays.get(&id);
+            if let Some(secret) = from_secret {
                 config::merge_secret(&mut entry, secret)?;
             }
             let enablement = enablement(&settings, from_scope, &cancel).await;
@@ -1185,7 +1265,7 @@ impl McpService {
                     let mut destination = to_snapshot.document;
                     destination.insert(id.clone(), skeleton);
                     settings
-                        .update(to_scope, &to_snapshot.revision, destination, &cancel)
+                        .update(to_scope, &to_snapshot.stored_revision, destination, &cancel)
                         .await?;
                     if let Some(secret) = to_secret {
                         if let Err(error) =
@@ -1201,7 +1281,7 @@ impl McpService {
                     let mut source = from_snapshot.document;
                     source.remove(&id);
                     settings
-                        .update(from_scope, &from_snapshot.revision, source, &cancel)
+                        .update(from_scope, &from_snapshot.stored_revision, source, &cancel)
                         .await
                         .map_err(|error| partial(error.into(), into_project))?;
                 }
@@ -1214,7 +1294,7 @@ impl McpService {
                     let mut destination = to_snapshot.document;
                     destination.insert(id.clone(), entry);
                     settings
-                        .update(to_scope, &to_snapshot.revision, destination, &cancel)
+                        .update(to_scope, &to_snapshot.stored_revision, destination, &cancel)
                         .await?;
                     if let Err(error) =
                         set_project_enabled(&settings, from_scope, &id, false, &cancel).await
@@ -1229,12 +1309,30 @@ impl McpService {
                     let mut source = from_snapshot.document;
                     source.remove(&id);
                     settings
-                        .update(from_scope, &from_snapshot.revision, source, &cancel)
+                        .update(from_scope, &from_snapshot.stored_revision, source, &cancel)
                         .await
                         .map_err(|error| partial(error.into(), into_project))?;
                 }
             }
             Ok(())
+        })
+        .await
+    }
+
+    async fn mutate<T, F, Fut>(&self, cancel: &CancellationToken, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<SettingsService>, CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let mutations = self.mutations.clone();
+        self.run(cancel, move |settings, cancel| async move {
+            let _guard = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(McpError::Cancelled),
+                guard = mutations.lock() => guard,
+            };
+            operation(settings, cancel).await
         })
         .await
     }
@@ -1323,6 +1421,7 @@ struct WriteOutcome {
 /// removal's captured record generation.
 async fn write(
     settings: &Arc<SettingsService>,
+    revisions: &ProjectRevisions,
     source: SettingsScope,
     expected: String,
     id: String,
@@ -1342,12 +1441,25 @@ async fn write(
         }
         set_project_enabled(settings, source, &id, false, cancel).await?;
         return Ok(WriteOutcome {
-            revision: snapshot.map_or(expected, |snapshot| snapshot.revision),
+            revision: match snapshot {
+                Ok(snapshot) => {
+                    let overlays = settings
+                        .read::<McpSecrets>(SettingsScope::User, cancel)
+                        .await;
+                    match (source, overlays) {
+                        (SettingsScope::Project(root), Ok(overlays)) => {
+                            revisions.token(root, &snapshot.revision, &overlays.revision)
+                        }
+                        _ => expected,
+                    }
+                }
+                Err(_) => expected,
+            },
             captured: None,
             entry_absent: false,
         });
     }
-    let snapshot = settings.read::<McpSettings>(source, cancel).await?;
+    let snapshot = source_snapshot(settings, revisions, source, cancel).await?;
     if snapshot.revision != expected {
         return Err(SettingsError::Conflict.into());
     }
@@ -1398,34 +1510,41 @@ async fn write(
         }
     };
     let Some(present) = removed else {
+        let written = settings
+            .update(source, &snapshot.stored_revision, document, cancel)
+            .await?;
         return Ok(WriteOutcome {
-            revision: settings
-                .update(source, &expected, document, cancel)
-                .await?
-                .revision,
+            revision: match source {
+                SettingsScope::User => written.revision,
+                SettingsScope::Project(root) => {
+                    revisions.token(root, &written.revision, &snapshot.overlays_revision)
+                }
+            },
             captured: None,
             entry_absent: false,
         });
     };
     // Capture the record generation this removal owns before the document
     // commit, so the cleanup cannot delete a replacement entry's record.
-    let captured = if project {
-        secret(settings, source, &id, cancel)
-            .await?
-            .map(|secret| secret.generation)
-    } else {
-        None
-    };
+    let captured = snapshot
+        .overlays
+        .get(&id)
+        .map(|secret| secret.generation.clone());
     let revision = if present {
         settings
-            .update(source, &expected, document, cancel)
+            .update(source, &snapshot.stored_revision, document, cancel)
             .await?
             .revision
     } else {
-        expected
+        snapshot.stored_revision
     };
     Ok(WriteOutcome {
-        revision,
+        revision: match source {
+            SettingsScope::User => revision,
+            SettingsScope::Project(root) => {
+                revisions.token(root, &revision, &snapshot.overlays_revision)
+            }
+        },
         captured,
         entry_absent: !present,
     })
@@ -1444,25 +1563,27 @@ async fn write(
 /// commits next and the withheld records last; a record failure after the
 /// source commit answers `ImportPartial`, and the source entries stay as
 /// written.
+#[allow(clippy::too_many_arguments)]
 async fn write_import(
     settings: &Arc<SettingsService>,
+    publication: &Publication,
+    revisions: &ProjectRevisions,
     source: SettingsScope,
     expected: String,
     document: McpSettings,
     resolutions: BTreeMap<String, import::ImportResolution>,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let snapshot = settings.read::<McpSettings>(source, cancel).await?;
+    let snapshot = source_snapshot(settings, revisions, source, cancel).await?;
     if snapshot.revision != expected {
         return Err(SettingsError::Conflict.into());
     }
     let project = matches!(source, SettingsScope::Project(_));
-    let overlays = overlays(settings, source, cancel).await?;
     let changes = import::plan(
         &document,
         &snapshot.document,
         project,
-        &overlays,
+        &snapshot.overlays,
         &resolutions,
     )?;
     if changes.is_empty() {
@@ -1474,7 +1595,7 @@ async fn write_import(
             target.insert(id, configuration);
         }
         return Ok(settings
-            .update(source, &expected, target, cancel)
+            .update(source, &snapshot.stored_revision, target, cancel)
             .await?
             .revision);
     }
@@ -1490,43 +1611,55 @@ async fn write_import(
     for id in changes.keys() {
         set_project_enabled(settings, source, id, false, cancel).await?;
     }
+    publication.settle(cancel).await?;
     let mut records = Vec::with_capacity(changes.len());
     for (id, configuration) in changes {
-        let (skeleton, record) = config::split_entry(&configuration);
+        let (skeleton, mut record) = config::split_entry(&configuration);
+        if let Some(record) = &mut record {
+            record.generation = uuid::Uuid::new_v4().to_string();
+        }
         target.insert(id.clone(), skeleton);
         records.push((id, record));
     }
     let revision = settings
-        .update(source, &expected, target, cancel)
+        .update(source, &snapshot.stored_revision, target, cancel)
         .await?
         .revision;
-    write_import_secrets(settings, &workspace, &records, cancel)
-        .await
-        .map_err(|_| McpError::ImportPartial)?;
-    Ok(revision)
+    let overlays_revision =
+        write_import_secrets(settings, &workspace, &records, &snapshot.overlays, cancel)
+            .await
+            .map_err(|_| McpError::ImportPartial)?;
+    let SettingsScope::Project(root) = source else {
+        unreachable!()
+    };
+    Ok(revisions.token(root, &revision, &overlays_revision))
 }
 
-/// Writes the withheld records of one import in one update, retrying a lost
-/// race: records of different ids commute, as enablement toggles do. An entry
-/// with no withheld part removes the destination's record, so the pair the
-/// import leaves is exactly the configuration the document carried.
+/// Writes the withheld records of one import. A lost race retries only while
+/// every selected record still matches the snapshot the import planned against.
+/// An entry with no withheld part removes the destination's record.
 async fn write_import_secrets(
     settings: &Arc<SettingsService>,
     workspace: &str,
     records: &[(String, Option<McpSecretEntry>)],
+    expected: &BTreeMap<String, McpSecretEntry>,
     cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<String> {
     loop {
         let snapshot = settings
             .read::<McpSecrets>(SettingsScope::User, cancel)
             .await?;
+        if records
+            .iter()
+            .any(|(id, _)| snapshot.document.get(workspace, id) != expected.get(id))
+        {
+            return Err(SettingsError::Conflict.into());
+        }
         let mut document = snapshot.document;
         for (id, record) in records {
             match record {
                 Some(record) => {
-                    let mut record = record.clone();
-                    record.generation = uuid::Uuid::new_v4().to_string();
-                    document.set(workspace, id, record);
+                    document.set(workspace, id, record.clone());
                 }
                 None => {
                     document.remove(workspace, id);
@@ -1537,32 +1670,54 @@ async fn write_import_secrets(
             .update(SettingsScope::User, &snapshot.revision, document, cancel)
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(snapshot) => return Ok(snapshot.revision),
             Err(SettingsError::Conflict) => continue,
             Err(error) => return Err(error.into()),
         }
     }
 }
 
-/// The `mcp-secrets` records of one project source's workspace, by id. A user
-/// source has no record.
-async fn overlays(
-    settings: &Arc<SettingsService>,
+struct SourceSnapshot {
+    document: McpSettings,
+    stored_revision: String,
+    revision: String,
+    overlays: BTreeMap<String, McpSecretEntry>,
+    overlays_revision: String,
+}
+
+async fn source_snapshot(
+    settings: &SettingsService,
+    revisions: &ProjectRevisions,
     source: SettingsScope,
     cancel: &CancellationToken,
-) -> Result<BTreeMap<String, McpSecretEntry>> {
-    let SettingsScope::Project(_) = source else {
-        return Ok(BTreeMap::new());
+) -> Result<SourceSnapshot> {
+    let snapshot = settings.read::<McpSettings>(source, cancel).await?;
+    let (revision, overlays, overlays_revision) = match source {
+        SettingsScope::User => (snapshot.revision.clone(), BTreeMap::new(), String::new()),
+        SettingsScope::Project(root) => {
+            let workspace = config::workspace(settings, source)?;
+            let mut secrets = settings
+                .read::<McpSecrets>(SettingsScope::User, cancel)
+                .await?;
+            let revision = revisions.token(root, &snapshot.revision, &secrets.revision);
+            (
+                revision,
+                secrets
+                    .document
+                    .entries
+                    .remove(&workspace)
+                    .unwrap_or_default(),
+                secrets.revision,
+            )
+        }
     };
-    let workspace = config::workspace(settings, source)?;
-    Ok(settings
-        .read::<McpSecrets>(SettingsScope::User, cancel)
-        .await?
-        .document
-        .entries
-        .get(&workspace)
-        .cloned()
-        .unwrap_or_default())
+    Ok(SourceSnapshot {
+        document: snapshot.document,
+        stored_revision: snapshot.revision,
+        revision,
+        overlays,
+        overlays_revision,
+    })
 }
 
 fn partial(_error: McpError, into_project: bool) -> McpError {
@@ -1728,6 +1883,7 @@ impl DynPlugin for McpPlugin {
                 publication,
                 stopping: ctx.cancellation_token(),
                 gate: Mutex::new(()),
+                mutations: Arc::new(tokio::sync::Mutex::new(())),
                 tasks: TaskTracker::new(),
             });
             let (owner, closing) = (service.clone(), auth.clone());

@@ -539,13 +539,21 @@ async fn mcp_import_replaces_a_withheld_record_without_an_entry() {
         )
         .await;
     assert_ok(&preview);
-    for id in ["kept", "plain"] {
-        assert_eq!(entry(&preview, id)["status"], "changed", "{id}");
-    }
-    // The import writes the destination's record itself, so a leftover
-    // record neither refuses the import nor merges into it: an entry with no
-    // withheld part removes the record.
+    assert_eq!(entry(&preview, "kept")["status"], "conflict");
+    assert_eq!(entry(&preview, "plain")["status"], "changed");
     let revision = project_revision(&mut client, &project).await;
+    let refused = client
+        .rpc(
+            "mcp.import.apply",
+            json!({"source":"project","cwd":project,"document":document,"expectedVersion":revision,"resolutions":[{"id":"kept","action":"import"}]}),
+        )
+        .await;
+    assert_eq!(refused["error"]["data"]["appError"], "mcp_import_conflict");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(project.join(".mcp.json")).unwrap())
+            .unwrap(),
+        json!({"mcpServers":{}})
+    );
     assert_ok(
         &client
             .rpc(
@@ -555,7 +563,7 @@ async fn mcp_import_replaces_a_withheld_record_without_an_entry() {
                     "cwd":project,
                     "document":document,
                     "expectedVersion":revision,
-                    "resolutions":[{"id":"kept","action":"import"}]
+                    "resolutions":[{"id":"kept","action":"replace"}]
                 }),
             )
             .await,
@@ -711,12 +719,8 @@ async fn project_revision(client: &mut Client, project: &std::path::Path) -> Val
     catalog["result"]["projectRevision"].clone()
 }
 
-/// A source compare-and-set that fails writes no entry, but it withdraws
-/// enablement before the source write, so the entry it would have replaced
-/// stays disabled: the fail-closed direction, which `mcp.set_enabled`
-/// reverses. The source keeps the winner's write and nothing of the loser's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_import_that_loses_the_source_cas_leaves_the_entry_disabled() {
+async fn mcp_import_serializes_competing_requests_and_refuses_stale_before_withdrawal() {
     let home = scratch("dm-import-cas");
     let project = home.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -780,9 +784,6 @@ async fn mcp_import_that_loses_the_source_cas_leaves_the_entry_disabled() {
     assert_eq!(catalog_entry(&catalog, "alpha")["enabled"], true);
     assert_eq!(catalog_entry(&catalog, "beta")["enabled"], true);
     let revision = catalog["result"]["projectRevision"].clone();
-    // Each document changes its entry's public skeleton, so the source
-    // revision moves: a replace that only rewrote withheld values would
-    // leave the bytes equal and the loser's compare-and-set would pass.
     let alpha = servers_document(json!({"alpha": {"command":"alpha-two","args":["--three"]}}));
     let beta = servers_document(json!({"beta": {"command":"beta-two","args":["--four"]}}));
     let alpha_id = client
@@ -833,8 +834,8 @@ async fn mcp_import_that_loses_the_source_cas_leaves_the_entry_disabled() {
     );
     assert_eq!(
         catalog_entry(&catalog, loser)["enabled"],
-        false,
-        "a failed source write leaves the entry it would have replaced disabled"
+        true,
+        "a queued request with a stale token changes neither the entry nor its enablement"
     );
     let stored: Value =
         serde_json::from_slice(&std::fs::read(project.join(".mcp.json")).unwrap()).unwrap();
@@ -1281,9 +1282,7 @@ async fn move_to_project(
     assert_ok(&client.rpc("mcp.move", json!({"id":id,"from":"user","to":"project","cwd":project,"expectedFromVersion":catalog["result"]["userRevision"],"expectedToVersion":catalog["result"]["projectRevision"]})).await);
 }
 
-/// The reply reports a bounded number of names per list and counts the rest,
-/// so a document of long unknown field names cannot push the reply past the
-/// transport frame.
+/// Field lists report omissions instead of presenting a truncated list as complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_import_bounds_the_field_names_one_entry_reports() {
     const MAX: usize = 32;
@@ -1564,9 +1563,11 @@ async fn mcp_import_answers_stale_revisions_and_refuses_oversize_documents() {
         )
         .await;
     assert_ok(&preview);
+    let catalog = client.rpc("mcp.catalog", json!({"cwd":project})).await;
+    assert_ok(&catalog);
     assert_eq!(
-        preview["result"]["revision"], "missing",
-        "a workspace without .mcp.json reports the catalog's missing revision"
+        preview["result"]["revision"],
+        catalog["result"]["projectRevision"]
     );
     let applied = client
         .rpc(
@@ -1575,13 +1576,13 @@ async fn mcp_import_answers_stale_revisions_and_refuses_oversize_documents() {
                 "source":"project",
                 "cwd":project,
                 "document":project_document,
-                "expectedVersion":"missing",
+                "expectedVersion":preview["result"]["revision"],
                 "resolutions":[{"id":"plain","action":"import"}]
             }),
         )
         .await;
     assert_ok(&applied);
-    assert_ne!(applied["result"]["revision"], "missing");
+    assert_ne!(applied["result"]["revision"], preview["result"]["revision"]);
     let stored: Value =
         serde_json::from_slice(&std::fs::read(project.join(".mcp.json")).unwrap()).unwrap();
     assert_eq!(stored["mcpServers"]["plain"], json!({"command":"echo"}));

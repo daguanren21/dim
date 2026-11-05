@@ -139,6 +139,7 @@ pub struct Publication {
     commands: mpsc::Sender<Command>,
     released: watch::Sender<()>,
     applications: StateCell<BTreeMap<McpSource, McpApplication>>,
+    pub(super) revisions: Arc<super::ProjectRevisions>,
 }
 impl Publication {
     pub(super) fn application(&self, source: McpSource) -> McpApplication {
@@ -355,6 +356,7 @@ impl DynPlugin for McpPublication {
                 commands,
                 released,
                 applications: StateCell::new(BTreeMap::new()),
+                revisions: Arc::new(super::ProjectRevisions::default()),
             });
             let worker = Worker {
                 port: port.clone(),
@@ -379,6 +381,7 @@ impl DynPlugin for McpPublication {
 
 struct Source {
     revision: String,
+    project_revision: Option<String>,
     configured: BTreeSet<String>,
     /// Effective configurations, by server id.
     current: BTreeMap<String, McpServerSettings>,
@@ -387,6 +390,11 @@ struct Source {
     /// Read, but applied with every project entry disabled because the user's
     /// enablement record could not be read. Selection stays available.
     degraded: Option<&'static str>,
+}
+impl Source {
+    fn effective_revision(&self) -> &str {
+        self.project_revision.as_deref().unwrap_or(&self.revision)
+    }
 }
 struct Generation {
     source: McpSource,
@@ -414,7 +422,22 @@ impl Projection {
     /// withdrawn even while its source is unreadable: the user's decision does
     /// not depend on the project file. A missing entry is withdrawn only when
     /// its source was read.
-    fn withdrawn(&self, generation: &Generation) -> bool {
+    fn withdrawn(
+        &self,
+        generation: &Generation,
+        projects: &[(usize, std::path::PathBuf)],
+        enablement: &McpProjectEnablement,
+    ) -> bool {
+        if let McpSource::Project(root) = generation.source
+            && !projects.iter().any(|(project, workspace)| {
+                *project == root
+                    && workspace
+                        .to_str()
+                        .is_some_and(|workspace| enablement.contains(workspace, &generation.id))
+            })
+        {
+            return true;
+        }
         self.sources.get(&generation.source).is_some_and(|source| {
             match source.current.get(&generation.id) {
                 Some(config) => !enabled(config),
@@ -435,23 +458,23 @@ impl Projection {
         let unreadable = enablement.is_err();
         let enablement = enablement.unwrap_or_default();
         let secrets = if projects.is_empty() {
-            Ok(McpSecrets::default())
+            Ok((McpSecrets::default(), String::new()))
         } else {
             settings
                 .read::<McpSecrets>(SettingsScope::User, cancel)
                 .await
-                .map(|snapshot| snapshot.document)
+                .map(|snapshot| (snapshot.document, snapshot.revision))
         };
         let secrets_unreadable = secrets.is_err();
-        let secrets = secrets.unwrap_or_default();
-        for source in [McpSource::User, McpSource::Plugins].into_iter().chain(
-            projects
-                .into_iter()
-                .map(|(root, _)| McpSource::Project(root)),
-        ) {
+        let (secrets, secrets_revision) = secrets.unwrap_or_default();
+        for source in [McpSource::User, McpSource::Plugins]
+            .into_iter()
+            .chain(projects.iter().map(|(root, _)| McpSource::Project(*root)))
+        {
             if secrets_unreadable && matches!(source, McpSource::Project(_)) {
                 let intent = self.sources.entry(source).or_insert_with(|| Source {
                     revision: String::new(),
+                    project_revision: None,
                     configured: BTreeSet::new(),
                     current: BTreeMap::new(),
                     error: None,
@@ -475,6 +498,7 @@ impl Projection {
                 Err(_) => {
                     let intent = self.sources.entry(source).or_insert_with(|| Source {
                         revision: String::new(),
+                        project_revision: None,
                         configured: BTreeSet::new(),
                         current: BTreeMap::new(),
                         error: None,
@@ -549,6 +573,14 @@ impl Projection {
             self.sources.insert(
                 source,
                 Source {
+                    project_revision: match source {
+                        McpSource::Project(root) => Some(self.port.revisions.applied_token(
+                            root,
+                            &revision,
+                            &secrets_revision,
+                        )),
+                        _ => None,
+                    },
                     revision,
                     configured,
                     current,
@@ -566,7 +598,7 @@ impl Projection {
             .generations
             .iter()
             .filter(|(_, g)| {
-                let withdrawn = self.withdrawn(g);
+                let withdrawn = self.withdrawn(g, &projects, &enablement);
                 if withdrawn {
                     g.withdrawn.store(true, Ordering::SeqCst);
                 }
@@ -581,7 +613,7 @@ impl Projection {
                     && self
                         .sources
                         .get(source)
-                        .is_some_and(|intent| intent.revision == *revision)
+                        .is_some_and(|intent| intent.effective_revision() == revision.as_str())
             });
         self.publish();
     }
@@ -606,7 +638,9 @@ impl Projection {
                 (
                     *source,
                     McpApplication {
-                        applied_revision: error.is_none().then(|| intent.revision.clone()),
+                        applied_revision: error
+                            .is_none()
+                            .then(|| intent.effective_revision().to_owned()),
                         error,
                         cleanup_error: self
                             .cleanup_failed
@@ -706,7 +740,10 @@ impl Projection {
             Err(_) => {
                 self.application_failed.insert(
                     (owner.id.clone(), source, id.clone()),
-                    (self.sources[&source].revision.clone(), owner.closed.clone()),
+                    (
+                        self.sources[&source].effective_revision().to_owned(),
+                        owner.closed.clone(),
+                    ),
                 );
                 self.publish();
                 return Err(McpError::Unavailable);
@@ -727,7 +764,10 @@ impl Projection {
             if owner.admits() && !cancel.is_cancelled() {
                 self.application_failed.insert(
                     (owner.id.clone(), source, id.clone()),
-                    (self.sources[&source].revision.clone(), owner.closed.clone()),
+                    (
+                        self.sources[&source].effective_revision().to_owned(),
+                        owner.closed.clone(),
+                    ),
                 );
             }
             self.publish();

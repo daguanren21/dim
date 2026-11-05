@@ -83,6 +83,9 @@ mod product_protocol;
 #[path = "transport_flow/mcp_import.rs"]
 mod mcp_import;
 
+#[path = "transport_flow/mcp_import_guards.rs"]
+mod mcp_import_guards;
+
 #[path = "transport_flow/model_startup.rs"]
 mod model_startup;
 

@@ -614,7 +614,7 @@ pub(super) fn provide(
             "mcp.auth.logout",
         ]
         .into_iter()
-        .map(|name| MethodDecl::new(name, !matches!(name, "mcp.catalog" | "mcp.configuration" | "mcp.inspect" | "mcp.temporary.capabilities" | "mcp.import.preview"), Interruption::Report))
+        .map(|name| MethodDecl::new(name, !matches!(name, "mcp.catalog" | "mcp.configuration" | "mcp.inspect" | "mcp.temporary.capabilities" | "mcp.import.preview"), if name == "mcp.import.apply" { Interruption::Drain } else { Interruption::Report }))
         .collect(),
         Arc::new(move |method, value, stopping, _| {
             let directory = directory.clone();

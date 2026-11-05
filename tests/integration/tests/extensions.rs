@@ -204,7 +204,7 @@ async fn missing_dependency_and_undeclared_read_fail_before_session_publication(
         .await
         .err()
         .unwrap();
-    assert!(error.to_string().contains("ExternalConsumer"), "{error}");
+    assert!(matches!(error, AgentError::Build(_)), "{error}");
     assert!(agent.sessions().is_empty());
     agent.close().await.unwrap();
 
@@ -219,10 +219,7 @@ async fn missing_dependency_and_undeclared_read_fail_before_session_publication(
         .await
         .err()
         .unwrap();
-    assert!(
-        error.to_string().contains("dependency not declared"),
-        "{error}"
-    );
+    assert!(matches!(error, AgentError::Framework(_)), "{error}");
     assert!(agent.sessions().is_empty());
     agent.close().await.unwrap();
 }

@@ -517,44 +517,72 @@ from the owner or stored in the browser.
 
 #### MCP import
 
-The MCP page imports a standard `mcpServers` document, the shape other MCP
-clients write, from a local file. The browser reads the file's text and sends it
-with `mcp.import.preview` for the selected scope — the user source, or the
-workspace's project source when the scope selector names one (`cwd` included).
-The page decodes nothing itself: the owner's preview supplies each entry's id,
-status (`identical`, `changed`, `conflict` or `invalid`), transport, changed
-field names with their JSON kinds, members the decoder keeps unused or drops,
-and the entry's error. The owner caps each entry's field-name lists, so the page
-states how many names the cap left out rather than showing a partial list as
-complete. The page shows the unknown top-level members and never renders a
-value, because the reply carries none. For a project preview it states that the
-workspace file receives each entry's public skeleton, while arguments,
-environment and header values, the bearer token, a URL with userinfo, path,
-query or fragment, hidden OAuth fields and unknown members go to the user-scope
-`mcp-secrets` record, as a move into project does.
+The MCP page has one **Import…** entrypoint and a native three-step dialog:
+Source → Preview → Confirm. It uses the page's workspace selector for project scope,
+or imports into the Dim user source. Opening it reads nothing. The user explicitly
+chooses a file or a folder; folder discovery considers only browser-provided files
+at recognized client paths, never the daemon's filesystem or a background scan.
+An arbitrary file can be selected with an explicit source format.
 
-Each previewed entry that decodes has an action: Import, Skip, Replace the
-existing entry, or Import under a new id with a new-id field. The defaults match
-the CLI: `changed` and `identical` import, `conflict` and `invalid` skip.
-`--only` restricts the default selection, and `--replace` or `--rename` — or
-this page's explicit action — selects the id it names whether or not `--only`
-lists it; a `conflict` or `invalid` entry only comes in through such an action.
-An `invalid` entry shows no action control, because the owner refuses every
-resolution but Skip for it, and says in its row that it cannot decode and can
-only be skipped. Rename needs a nonempty new id before Apply is enabled.
+The browser's external-file boundary converts supported foreign formats into the
+standard `mcpServers` document. Standard JSON is forwarded unchanged; its validation
+and all writes remain with the native owner. Preview/apply retain their existing
+`document`/`resolutions` wire contract, without a client-format parameter. The CLI
+continues to accept standard JSON; these adapters belong only to the Web importer.
 
-Apply sends `mcp.import.apply` with the previewed document, its `revision` as
-`expectedVersion`, and one resolution per entry. On success the page drops the
-preview, rereads `mcp.catalog` and states that imported and replaced entries
-start disabled: a user entry is written with `enabled: false`, and a project
-entry's enablement record is withdrawn before the write. On
-`mcp_settings_conflict` the page says the source changed, that no entry was imported and that an
-entry the import would have replaced may now be disabled; it keeps the preview and offers Preview
-again, which re-previews the same document; it never retries the apply. The owner codes
-(`mcp_import_conflict`, `mcp_import_partial`, `mcp_invalid_config`) are shown as the owner's
-message, and the preview stays open for a different selection; after a partial import a new
-preview reports the written ids as conflicts, which a Replace rewrites together with their
-records.
+| Source format | Recognized folder paths | Conversion boundary |
+| --- | --- | --- |
+| Standard JSON / Claude Code | `.claude.json`, `.mcp.json`, `mcp.json` | Native decoder; no client-side rewriting |
+| Codex | `.codex/config.toml` | `mcp_servers`, HTTP/header and bearer-variable fields, integral millisecond tool timeout |
+| OMP | `.omp/mcp.json`, `.omp/.mcp.json`, their `agent/` and `profiles/<name>/agent/` variants | Reject env/header credential-helper indirection and request-timeout semantics; command names remain literal |
+| Qoder | `.qoder/settings.json`, `.qoder/settings.local.json` | Invert `disabled`; refuse gateway credentials and unsupported client semantics |
+| Kimi Code | `.kimi/mcp.json`, `.kimi-code/mcp.json` | Transport, bearer-variable and tool-timeout fields |
+| Cursor | `.cursor/mcp.json` | URL-only HTTP and `${env:NAME}` references |
+| Gemini CLI | `.gemini/settings.json` | `url` is SSE, `httpUrl` is HTTP; percent-encoded URLs stay literal |
+| VS Code | `.vscode/mcp.json` | `servers` root and `${env:NAME}` references; inputs/envFile/sandbox are unsupported |
+| OpenCode | `opencode.json`, `opencode.jsonc` | `mcp` root, local command array/environment, remote HTTP and `{env:NAME}`; JSONC is explicitly rejected |
+| Compatible standard JSON clients | `.codeium/windsurf/`, `.windsurf/`, `.devin/`, `.config/devin/` `mcp_config[.local].json`; `.copilot/mcp-config.json` | Standard JSON path |
+
+Conversion never expands environment references, reads credential files, runs a
+helper, starts a server or contacts an endpoint. Unsupported foreign semantics are
+shown as local, unselectable issues; compatible neighbors still reach native
+preview. Unrelated foreign client settings are omitted with a fixed safe warning.
+Malformed documents fail with safe diagnostics, not parser excerpts or an empty
+catalog. The file boundary enforces the owner's 8 MiB and 1,000-entry limits.
+
+The preview shows ids, transport, native status (`identical`, `changed`, `conflict`,
+`invalid`), changed field names/kinds, unsupported field effects and omitted-name
+counts. It never renders configuration values. Every row starts unselected. Only
+one row's resolver expands at a time; Skip, Rename and explicit Replace resolve
+collisions. Invalid rows cannot be selected. Target ids must be nonempty and unique.
+This differs intentionally from the CLI's selection defaults; the CLI is unchanged.
+
+The final confirmation names only accepted source/target ids, their actions and the
+destination. A project destination states that public skeletons go to `.mcp.json`
+and withheld values stay in user-local storage, following the
+[owner's split and recovery contract](appserver/mcp-management.md#d25-a-project-import-writes-through-the-withheld-split).
+New and replaced entries start disabled; identical entries retain their enablement.
+
+Apply sends the reviewed normalized document, preview revision and native resolutions.
+Success returns only a revision: the dialog derives its completed groups from those
+accepted resolutions and awaits the parent's catalog/detail refresh before releasing
+busy state. A refresh failure does not erase the truthful write outcome. On
+`mcp_import_partial`, accepted target ids are labelled **needing review**, never
+invented as completed; known skipped and unchanged rows remain distinguishable.
+On `mcp_settings_conflict`, the page states that no entry was imported but a target
+the request would have replaced may now be disabled, matching the owner's fail-closed
+withdrawal contract.
+Any failed apply requires a fresh target preview before another attempt. Re-preview
+clears selections and uses the selected source snapshot, not newly read disk content.
+
+A browser `File` is a snapshot. Changed or unreadable disk content requires the
+explicit **Re-select file/folder** action, which acquires new files. Cancelling the
+native picker preserves the current dialog and selection. Scope changes, disconnect
+and unmount invalidate late replies. The dialog is teleported outside the settings
+form so Enter cannot submit it; offline Cancel remains usable, and closing restores
+focus to the opener. Desktop and narrow layouts keep the header, steps, destination
+and footer available while content scrolls, using the existing Geist typography,
+tokens and light/dark themes.
 
 #### Diagnostics: the legacy logging controls
 

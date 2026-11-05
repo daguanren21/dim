@@ -5,8 +5,8 @@ use dim_app_server::{
     mcp::{
         McpChange, McpError, McpPlugin, McpService, McpSource,
         config::{
-            McpPluginServers, McpProjectEnablement, McpSecrets, McpServerSettings, McpSettings,
-            RemoteTransport,
+            BearerAuth, McpPluginServers, McpProjectEnablement, McpSecrets, McpServerSettings,
+            McpSettings, RemoteTransport,
         },
     },
     settings::{
@@ -296,6 +296,130 @@ async fn loader_publication_is_scoped_secret_free_and_restart_stable() {
             .is_err()
     );
     restarted.close().await;
+}
+
+#[tokio::test]
+async fn an_overlay_only_edit_invalidates_a_failed_project_application_without_acquiring() {
+    for disabled in ["McpConnections", "StandaloneMcpServer"] {
+        let fixture = Fixture::new().await;
+        let cancel = CancellationToken::new();
+        let workspace = fixture.home.join("project");
+        let catalog = fixture.mcp.catalog(Some(1), &cancel).await.unwrap();
+        fixture
+            .mcp
+            .move_entry(
+                McpSource::User,
+                McpSource::Project(1),
+                "user-only".into(),
+                catalog.user_revision,
+                catalog.project_revision.unwrap(),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let revision = fixture
+            .mcp
+            .catalog(Some(1), &cancel)
+            .await
+            .unwrap()
+            .project_revision
+            .unwrap();
+        fixture
+            .mcp
+            .update(
+                SettingsScope::Project(1),
+                revision.clone(),
+                "user-only".into(),
+                McpChange::SetEnabled(true),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let skeleton = fs::read(workspace.join(".mcp.json")).unwrap();
+        let stored_revision = fixture
+            .settings
+            .read::<McpSettings>(SettingsScope::Project(1), &cancel)
+            .await
+            .unwrap()
+            .revision;
+
+        let layers = fixture.loader.layers();
+        let mut unavailable = layers.clone();
+        unavailable.push(rutis_loader::Layer::new(
+            "publication-failure",
+            vec![rutis_loader::Patch {
+                id: Some(disabled.into()),
+                overrides: [("disabled".into(), json!(true))].into_iter().collect(),
+                ..Default::default()
+            }],
+        ));
+        fixture.loader.reconcile(unavailable, None).await.unwrap();
+        assert!(matches!(
+            fixture
+                .mcp
+                .server(Some(1), "user-only".into(), &cancel)
+                .await,
+            Err(McpError::Unavailable)
+        ));
+        fixture.loader.reconcile(layers, None).await.unwrap();
+
+        let target = json!({"source":"project", "id":"user-only", "cwd":workspace});
+        let inspected = management(&fixture, "mcp.inspect", target.clone()).await;
+        assert_eq!(inspected["connections"], json!([]));
+        let failed = management(&fixture, "mcp.catalog", json!({"cwd":workspace})).await;
+        assert_eq!(failed["projectRevision"], revision);
+        assert!(failed["projectApplication"]["error"].is_string());
+        assert!(failed["projectApplication"]["appliedRevision"].is_null());
+
+        let mut overlay = fixture
+            .settings
+            .read::<McpSecrets>(SettingsScope::User, &cancel)
+            .await
+            .unwrap();
+        overlay
+            .document
+            .entries
+            .get_mut(workspace.to_str().unwrap())
+            .unwrap()
+            .get_mut("user-only")
+            .unwrap()
+            .auth = Some(BearerAuth::Bearer {
+            token: "rotated-test-secret".into(),
+        });
+        let written = fixture
+            .settings
+            .update(
+                SettingsScope::User,
+                &overlay.revision,
+                overlay.document,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_ne!(written.revision, overlay.revision);
+
+        let inspected = management(&fixture, "mcp.inspect", target).await;
+        assert_eq!(inspected["enabled"], true);
+        assert_eq!(inspected["connections"], json!([]));
+        let current = management(&fixture, "mcp.catalog", json!({"cwd":workspace})).await;
+        assert_ne!(current["projectRevision"], failed["projectRevision"]);
+        assert!(current["projectApplication"]["error"].is_null());
+        assert_eq!(
+            current["projectApplication"]["appliedRevision"],
+            current["projectRevision"]
+        );
+        assert_eq!(fs::read(workspace.join(".mcp.json")).unwrap(), skeleton);
+        assert_eq!(
+            fixture
+                .settings
+                .read::<McpSettings>(SettingsScope::Project(1), &cancel)
+                .await
+                .unwrap()
+                .revision,
+            stored_revision
+        );
+        fixture.close().await;
+    }
 }
 
 #[tokio::test]
@@ -991,24 +1115,52 @@ async fn admitted_writes_survive_dropped_waiters_and_stop_with_the_plugin() {
     fixture.close().await;
 }
 
+async fn move_with_failed_overlay(
+    fixture: &Fixture,
+    cancel: &CancellationToken,
+) -> dim_app_server::mcp::Result<()> {
+    let catalog = fixture.mcp.catalog(Some(1), cancel).await.unwrap();
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let arrived = changed.clone();
+    fixture
+        .root
+        .listen::<SettingsChanged>()
+        .name(settings_changes("mcp"))
+        .on(move |event, _| {
+            if event.scope == SettingsScope::Project(1) {
+                arrived.notify_one();
+            }
+            async { Ok(None) }
+        })
+        .unwrap();
+    let path = fixture.files.path(0, "mcp-secrets.json").unwrap();
+    let lease = fixture.files.lock(&path, cancel).await.unwrap();
+    let pending = fixture.mcp.move_entry(
+        McpSource::User,
+        McpSource::Project(1),
+        "user-only".into(),
+        catalog.user_revision,
+        catalog.project_revision.unwrap(),
+        cancel,
+    );
+    tokio::pin!(pending);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut pending => panic!("move returned before the controlled overlay failure: {result:?}"),
+            _ = changed.notified() => {},
+        }
+    }).await.unwrap();
+    fs::create_dir(fixture.home.join("mcp-secrets.json")).unwrap();
+    drop(lease);
+    pending.await
+}
+
 #[tokio::test]
 async fn scope_move_partial_is_recoverable_and_remove_cleans_the_overlay() {
     let fixture = Fixture::new().await;
     let cancel = CancellationToken::new();
-    let catalog = fixture.mcp.catalog(Some(1), &cancel).await.unwrap();
     let secrets_path = fixture.home.join("mcp-secrets.json");
-    fs::create_dir(&secrets_path).unwrap();
-    let result = fixture
-        .mcp
-        .move_entry(
-            McpSource::User,
-            McpSource::Project(1),
-            "user-only".into(),
-            catalog.user_revision.clone(),
-            catalog.project_revision.clone().unwrap(),
-            &cancel,
-        )
-        .await;
+    let result = move_with_failed_overlay(&fixture, &cancel).await;
     assert!(matches!(
         result,
         Err(McpError::MovePartial { into_project: true })
@@ -1413,22 +1565,26 @@ async fn a_conflicting_remove_keeps_the_project_entry_and_its_overlay() {
         .unwrap()
         .project_revision
         .unwrap();
-    let mut document = fixture
+    let snapshot = fixture
         .settings
         .read::<McpSettings>(SettingsScope::Project(1), &cancel)
         .await
-        .unwrap()
-        .document;
+        .unwrap();
+    let mut document = snapshot.document;
     let Some(McpServerSettings::Remote { extra, .. }) = document.configure_mut("user-only") else {
         panic!("the moved entry is remote");
     };
     extra.insert("note".into(), json!(1));
-    let patched = fixture
+    fixture
         .settings
-        .update(SettingsScope::Project(1), &revision, document, &cancel)
+        .update(
+            SettingsScope::Project(1),
+            &snapshot.revision,
+            document,
+            &cancel,
+        )
         .await
-        .unwrap()
-        .revision;
+        .unwrap();
 
     assert!(matches!(
         fixture
@@ -1463,7 +1619,7 @@ async fn a_conflicting_remove_keeps_the_project_entry_and_its_overlay() {
     let lease = fixture.files.lock(&path, &cancel).await.unwrap();
     let pending = fixture.mcp.update(
         SettingsScope::Project(1),
-        patched,
+        catalog.project_revision.unwrap(),
         "user-only".into(),
         McpChange::Remove,
         &cancel,
@@ -1509,20 +1665,8 @@ async fn an_into_project_partial_is_finished_after_a_restart() {
     let fixture = Fixture::new().await;
     let cancel = CancellationToken::new();
     let secrets_path = fixture.home.join("mcp-secrets.json");
-    let catalog = fixture.mcp.catalog(Some(1), &cancel).await.unwrap();
-    fs::create_dir(&secrets_path).unwrap();
     assert!(matches!(
-        fixture
-            .mcp
-            .move_entry(
-                McpSource::User,
-                McpSource::Project(1),
-                "user-only".into(),
-                catalog.user_revision,
-                catalog.project_revision.unwrap(),
-                &cancel,
-            )
-            .await,
+        move_with_failed_overlay(&fixture, &cancel).await,
         Err(McpError::MovePartial { into_project: true })
     ));
     fs::remove_dir(&secrets_path).unwrap();
