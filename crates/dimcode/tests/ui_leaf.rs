@@ -422,7 +422,7 @@ fn normal_dimcode_is_the_leaf_until_it_leaves() {
     }
     // `/new` goes home; the first message starts the Session the leaf moves to.
     pty.write(b"/new\r");
-    pty.read_until("new session");
+    pty.read_until("─ new session ");
     pty.write(b"leaf-switch-proof\r");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
