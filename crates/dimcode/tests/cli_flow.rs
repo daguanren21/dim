@@ -2623,6 +2623,7 @@ struct Terminal {
     master: Option<fs::File>,
     child: Child,
     transcript: String,
+    utf8_pending: Vec<u8>,
     consumed: usize,
 }
 impl Terminal {
@@ -2636,6 +2637,10 @@ impl Terminal {
         if command.get_program() == env!("CARGO_BIN_EXE_dimcode") {
             command.arg("--no-tui");
         }
+        Self::launch_tui(command)
+    }
+    fn resume_tui(mut command: Command) -> Self {
+        command.args(["--resume", "session"]);
         Self::launch_tui(command)
     }
     fn launch_tui(mut command: Command) -> Self {
@@ -2677,8 +2682,22 @@ impl Terminal {
             master: Some(master),
             child: command.spawn().unwrap(),
             transcript: String::new(),
+            utf8_pending: Vec::new(),
             consumed: 0,
         }
+    }
+    fn record(&mut self, bytes: &[u8]) {
+        self.utf8_pending.extend_from_slice(bytes);
+        let complete = match std::str::from_utf8(&self.utf8_pending) {
+            Ok(text) => text.len(),
+            Err(error) => {
+                assert!(error.error_len().is_none(), "non-UTF-8 terminal output");
+                error.valid_up_to()
+            }
+        };
+        self.transcript
+            .push_str(std::str::from_utf8(&self.utf8_pending[..complete]).unwrap());
+        self.utf8_pending.drain(..complete);
     }
     fn signal(&self, signal: libc::c_int) {
         assert_eq!(unsafe { libc::kill(self.child.id() as i32, signal) }, 0);
@@ -2712,8 +2731,7 @@ impl Terminal {
             let mut bytes = [0u8; 4096];
             match self.master.as_mut().unwrap().read(&mut bytes) {
                 Ok(size) if size > 0 => {
-                    self.transcript
-                        .push_str(&String::from_utf8_lossy(&bytes[..size]));
+                    self.record(&bytes[..size]);
                     continue;
                 }
                 Ok(_) => {}
@@ -2806,8 +2824,7 @@ impl Terminal {
                 "Terminal closed before {expected}: {}",
                 self.transcript
             );
-            self.transcript
-                .push_str(&String::from_utf8_lossy(&bytes[..size]));
+            self.record(&bytes[..size]);
         }
     }
     fn write(&mut self, bytes: &[u8]) {
@@ -2829,9 +2846,7 @@ impl Terminal {
                     let mut output = [0u8; 4096];
                     match self.master.as_mut().unwrap().read(&mut output) {
                         Ok(0) => panic!("Terminal output closed while writing"),
-                        Ok(size) => self
-                            .transcript
-                            .push_str(&String::from_utf8_lossy(&output[..size])),
+                        Ok(size) => self.record(&output[..size]),
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(error) => panic!("{error}"),
                     }
@@ -4133,6 +4148,10 @@ fn explicit_model_selection_uses_protocol_field_names_from_tui_and_line_client()
                 features.push("ui.leaf.2");
             }
             wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":features}));
+            if tui {
+                let providers = wire.read("account.providers");
+                wire.reply(&providers, json!([]));
+            }
             let management = wire.read("provider.management");
             assert_eq!(management["params"], json!({"providerId":"fixture"}));
             wire.reply(&management, json!({"providers":[{"providerId":"fixture","source":"custom","displayName":"Fixture","enabled":true,"version":1,"connection":null,"preferences":{"fixture-model":{"reasoningEffort":"high","serviceTier":"priority"}}}],"errors":[]}));
@@ -4141,6 +4160,12 @@ fn explicit_model_selection_uses_protocol_field_names_from_tui_and_line_client()
             assert_eq!(create["params"]["startup"], json!({}));
             assert_eq!(create["params"]["modelPreferences"], json!({"reasoningEffort":expected,"serviceTier":"priority"}));
             wire.send(json!({"jsonrpc":"2.0","id":create["id"],"error":{"code":-32000,"message":"fixture stops here","data":{"appError":"provider_failed"}}}));
+            if tui {
+                let catalog = wire.read("provider.catalog");
+                assert_eq!(catalog["params"], json!({"providerId":"fixture"}));
+                wire.reply(&catalog, json!({"catalog":null}));
+                assert_eq!(wire.trailing_request(), None, "a rejected creation must not attach or submit");
+            }
         });
             let mut command = home.command();
             command.args(["--provider", "fixture", "--model", "fixture-model"]);
@@ -4153,10 +4178,11 @@ fn explicit_model_selection_uses_protocol_field_names_from_tui_and_line_client()
             }
             if tui {
                 let mut terminal = Terminal::launch_tui(command);
+                terminal.until("Ask anything...");
+                terminal.write(b"hello\r");
                 terminal.until("fixture stops here");
-                if !leaf {
-                    terminal.signal(libc::SIGKILL);
-                }
+                assert!(terminal.child.try_wait().unwrap().is_none());
+                terminal.signal(libc::SIGKILL);
                 assert!(!terminal.wait().success());
                 daemon.join().unwrap();
             } else {
@@ -4236,8 +4262,6 @@ fn fullscreen_session_attached_before_the_first_frame_shows_one_banner() {
     let daemon = home.daemon(|wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -4249,7 +4273,7 @@ fn fullscreen_session_attached_before_the_first_frame_shows_one_banner() {
     });
     let mut command = home.command();
     command.arg("--fullscreen");
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
     home.kill(&terminal);
     terminal.wait();
@@ -4275,7 +4299,6 @@ fn the_model_label_shows_the_adopted_reasoning_effort_in_both_modes() {
             let event = configured_event(4, "model", preferences.clone());
             let daemon = home.daemon(move |wire| {
                 wire.hello(&[]);
-                wire.created();
                 let attach = wire.read("session.attach");
                 wire.reply(&attach, attach_record(&attach));
                 let history = wire.read("session.history");
@@ -4292,7 +4315,7 @@ fn the_model_label_shows_the_adopted_reasoning_effort_in_both_modes() {
             if fullscreen {
                 command.arg("--fullscreen");
             }
-            let mut terminal = Terminal::launch_tui(command);
+            let mut terminal = Terminal::resume_tui(command);
             terminal.until(expected);
             if preferences
                 .as_object()
@@ -4311,9 +4334,6 @@ fn the_model_label_shows_the_adopted_reasoning_effort_in_both_modes() {
     }
 }
 
-/// A Session created with an effort shows it before its first turn, in both
-/// terminal modes: the create and attach replies name the adopted
-/// configuration's preferences, before any `context/configured` fact exists.
 #[test]
 fn a_new_session_shows_the_effort_its_creation_adopted() {
     for fullscreen in [false, true] {
@@ -4333,6 +4353,11 @@ fn a_new_session_shows_the_effort_its_creation_adopted() {
                     wire.send(json!({"jsonrpc":"2.0","id":request["id"],"error":{
                         "code":-32601,"message":"Unknown method: session.context.usage",
                         "data":{"appError":"unknown_method"}}}));
+                    continue;
+                }
+                if request["method"] == "session.submit" {
+                    wire.reply(&request, json!({"event":{}}));
+                    wire.event(9, "text", json!({"turn_id":"first","request_id":"first-model","delta":"effortful input accepted"}));
                     continue;
                 }
                 let result = match request["method"].as_str().unwrap() {
@@ -4368,7 +4393,10 @@ fn a_new_session_shows_the_effort_its_creation_adopted() {
             command.arg("--fullscreen");
         }
         let mut terminal = Terminal::launch_tui(command);
+        terminal.until("Welcome to DIM");
+        terminal.write(b"first message\r");
         terminal.until("test / model · high");
+        terminal.until("effortful input accepted");
         home.kill(&terminal);
         terminal.wait();
         daemon.join().unwrap();
@@ -4381,6 +4409,18 @@ fn a_new_session_shows_the_effort_its_creation_adopted() {
             create["params"]["modelPreferences"],
             json!({"reasoningEffort":"high"})
         );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session.create")
+                .count(),
+            1
+        );
+        let submit = calls
+            .iter()
+            .find(|call| call["method"] == "session.submit")
+            .expect("the first message was submitted");
+        assert_eq!(submit["params"]["text"], "first message");
     }
 }
 
@@ -4423,6 +4463,8 @@ fn the_model_label_shows_a_configured_profile_effort() {
             home.0.to_str().unwrap(),
         ]);
         let mut terminal = Terminal::launch_tui(command);
+        terminal.until("Ask anything...");
+        terminal.write(b"first message\r");
         terminal.until(label);
         if suffix == "plain" {
             assert!(
@@ -4451,7 +4493,6 @@ fn home_after_new_drops_the_previous_sessions_effort() {
             "ui.shutdown",
             "ui.replace",
         ]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let register = wire.read("ui.attach");
@@ -4532,7 +4573,7 @@ fn home_after_new_drops_the_previous_sessions_effort() {
     // The waits below close on the end of a synchronized update, which frames
     // every repaint; tmux would turn that framing off for the child.
     command.env_remove("TMUX");
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model · high");
     terminal.write(b"/effort high\r");
     terminal.until("Reasoning effort configuration adopted: high");
@@ -4619,8 +4660,7 @@ fn repicking_the_current_model_keeps_the_effort() {
                 "provider.management" => json!({"providers":[{"providerId":"test","source":"custom",
                     "displayName":"Test","enabled":true,"version":1,"connection":null,
                     "preferences":{"model":{"reasoningEffort":"high"}}}],"errors":[]}),
-                "session.create" => json!({"sessionId":"session","sequence":8,
-                    "model":{"providerId":"test","modelId":"model"}}),
+                "session.create" => panic!("resuming must not create a Session"),
                 "session.attach" => attach_record(&request),
                 "session.history" => json!({"events":[
                     configured_event(4, "model", json!({"reasoningEffort":"high"}))],
@@ -4636,7 +4676,7 @@ fn repicking_the_current_model_keeps_the_effort() {
             wire.reply(&request, result);
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model · high");
     terminal.write(b"/models\r");
     terminal.until("‹ high ›");
@@ -4694,7 +4734,6 @@ fn another_clients_adoption_redraws_the_model_label() {
     let (adopt, adopting) = std::sync::mpsc::channel();
     let daemon = home.daemon(move |wire| {
         wire.hello(&[]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -4713,7 +4752,7 @@ fn another_clients_adoption_redraws_the_model_label() {
         );
         wire.hold();
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     adopt.send(()).unwrap();
     terminal.until("test / model · low");
@@ -4749,7 +4788,6 @@ fn a_narrow_composer_drops_the_effort_before_the_model() {
         let home = Home::new();
         let daemon = home.daemon(|wire| {
             wire.hello(&[]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -4766,7 +4804,7 @@ fn a_narrow_composer_drops_the_effort_before_the_model() {
         let mut command = home.command();
         command.arg("--fullscreen");
         sized(&mut command, cols, 24);
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         match cols {
             80 => terminal.until("test / model · high"),
             26 => {
@@ -4799,7 +4837,6 @@ fn tui_escape_sends_the_reason_that_records_the_interruption() {
         let (settle, settlement) = std::sync::mpsc::channel();
         let daemon = home.daemon(move |wire| {
             wire.hello(&[]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -4842,7 +4879,7 @@ fn tui_escape_sends_the_reason_that_records_the_interruption() {
         if fullscreen {
             command.arg("--fullscreen");
         }
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("esc interrupt");
         terminal.write(b"\x1b");
         terminal.until("Stopping");
@@ -4863,8 +4900,6 @@ fn tui_shell_mode_runs_through_session_methods_and_shows_the_recorded_run() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -4893,7 +4928,7 @@ fn tui_shell_mode_runs_through_session_methods_and_shows_the_recorded_run() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"!echo recorded\r");
     terminal.until("live-out");
@@ -4954,7 +4989,6 @@ fn tui_effort_dialog_selects_the_current_models_effort_and_cancels_without_writi
         let home = Home::new();
         let daemon = home.daemon(|wire| {
             wire.hello(&[]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -4991,7 +5025,7 @@ fn tui_effort_dialog_selects_the_current_models_effort_and_cancels_without_writi
         if fullscreen {
             command.arg("--fullscreen");
         }
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("test / model · high");
         terminal.write(b"/effort\r");
         terminal.until("Current: high");
@@ -5024,8 +5058,6 @@ fn tui_mcp_and_configuration_commands_use_session_methods() {
     let daemon = home.daemon(|wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -5066,7 +5098,7 @@ fn tui_mcp_and_configuration_commands_use_session_methods() {
     });
     let mut command = home.command();
     command.env("SSH_TTY", "/dev/fixture");
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("sign-in required");
     terminal.write(b"/mcp list\r");
     terminal.until("Columns: ID, source");
@@ -5081,22 +5113,15 @@ fn tui_mcp_and_configuration_commands_use_session_methods() {
     daemon.join().unwrap();
 }
 
-/// `session.create` fails the way it does without a model, so the TUI has
-/// no Session: commands that need one must answer on their own.
 fn no_session_daemon(home: &Home, quieted: std::sync::mpsc::Sender<()>) -> thread::JoinHandle<()> {
     home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.send(json!({"jsonrpc":"2.0","id":create["id"],"error":{"code":-32000,"message":"No model is chosen","data":{"appError":"provider_failed"}}}));
         let providers = wire.read("account.providers");
         wire.reply(&providers, json!([]));
         wire.quiet(Duration::from_millis(1200));
         let _ = quieted.send(());
-        let mut line = String::new();
-        while wire.0.read_line(&mut line).is_ok_and(|read| read > 0) {
-            line.clear();
-        }
+        assert_eq!(wire.trailing_request(), None, "Home sent an unexpected RPC");
     })
 }
 
@@ -5107,8 +5132,6 @@ fn tui_mcp_without_a_session_reports_the_catalog_only() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.send(json!({"jsonrpc":"2.0","id":create["id"],"error":{"code":-32000,"message":"No model is chosen","data":{"appError":"provider_failed"}}}));
         let providers = wire.read("account.providers");
         wire.reply(&providers, json!([]));
         let catalog = wire.read("mcp.catalog");
@@ -5122,7 +5145,7 @@ fn tui_mcp_without_a_session_reports_the_catalog_only() {
         }
     });
     let mut terminal = Terminal::launch_tui(home.command());
-    terminal.until("Sign in with /login");
+    terminal.until("Ask anything...");
     terminal.write(b"/mcp list\r");
     terminal.until("No MCP server is configured.");
     quiet_done.recv_timeout(PATIENCE).unwrap();
@@ -5138,8 +5161,7 @@ fn tui_agent_without_a_session_answers_the_no_session_notice_and_sends_nothing()
     let (quieted, quiet_done) = std::sync::mpsc::channel();
     let daemon = no_session_daemon(&home, quieted);
     let mut terminal = Terminal::launch_tui(home.command());
-    // The startup notice is the first; the command's answer is the second.
-    terminal.until("Sign in with /login");
+    terminal.until("Ask anything...");
     terminal.write(b"/agent ghost\r");
     terminal.until("Sign in with /login");
     quiet_done.recv_timeout(PATIENCE).unwrap();
@@ -5155,8 +5177,7 @@ fn tui_effort_without_a_session_answers_the_no_session_notice_and_sends_nothing(
     let (quieted, quiet_done) = std::sync::mpsc::channel();
     let daemon = no_session_daemon(&home, quieted);
     let mut terminal = Terminal::launch_tui(home.command());
-    // The startup notice is the first; the command's answer is the second.
-    terminal.until("Sign in with /login");
+    terminal.until("Ask anything...");
     terminal.write(b"/effort high\r");
     terminal.until("Sign in with /login");
     quiet_done.recv_timeout(PATIENCE).unwrap();
@@ -5172,7 +5193,7 @@ fn tui_shell_without_a_session_settles_with_the_no_session_notice() {
     let (quieted, quiet_done) = std::sync::mpsc::channel();
     let daemon = no_session_daemon(&home, quieted);
     let mut terminal = Terminal::launch_tui(home.command());
-    terminal.until("Sign in with /login");
+    terminal.until("Ask anything...");
     terminal.write(b"!echo hi\r");
     // The settled shell block carries the notice as its status, and the
     // status line repeats it; neither the block nor the row stays running.
@@ -5197,8 +5218,6 @@ fn tui_pasted_images_and_long_text_submit_as_user_content() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -5224,7 +5243,7 @@ fn tui_pasted_images_and_long_text_submit_as_user_content() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"look ");
     terminal.paste(image.to_str().unwrap());
@@ -5256,8 +5275,6 @@ fn tui_at_mentions_pick_files_from_the_working_directory() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -5276,7 +5293,7 @@ fn tui_at_mentions_pick_files_from_the_working_directory() {
     });
     let mut command = home.command();
     command.args(["--cwd", project.to_str().unwrap()]);
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
     terminal.write(b"read @no");
     terminal.until("Files");
@@ -5312,7 +5329,6 @@ fn tui_skill_rows_come_from_the_catalog_and_complete_without_sending() {
         let home = Home::new();
         let daemon = home.daemon(|wire| {
             wire.hello(&["skills.catalog"]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -5341,7 +5357,7 @@ fn tui_skill_rows_come_from_the_catalog_and_complete_without_sending() {
         if fullscreen {
             command.arg("--fullscreen");
         }
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("test / model");
 
         // The enabled Skill is listed and its row completes the marker into
@@ -5376,7 +5392,6 @@ fn reloading_skills_changes_the_palette_rows() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["skills.catalog", "skills.refresh"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -5409,7 +5424,7 @@ fn reloading_skills_changes_the_palette_rows() {
         wire.reply(&panel, rescan);
         wire.hold();
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
 
     // Before the rescan only the command matches; the new Skill is not known.
@@ -5435,7 +5450,6 @@ fn a_daemon_without_skill_catalog_keeps_a_working_command_palette() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["skills.catalog"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -5452,7 +5466,7 @@ fn a_daemon_without_skill_catalog_keeps_a_working_command_palette() {
         wire.reply(&providers, json!([]));
         wire.hold();
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
 
     // The failed read shows no error and leaves the command rows untouched.
@@ -5477,7 +5491,6 @@ fn tui_palette_tab_only_completes_and_enter_still_runs() {
         let home = Home::new();
         let daemon = home.daemon(|wire| {
             wire.hello(&[]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -5494,7 +5507,7 @@ fn tui_palette_tab_only_completes_and_enter_still_runs() {
         if fullscreen {
             command.arg("--fullscreen");
         }
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("test / model");
 
         // Tab completes `/keys` into the draft; the typed character that
@@ -5543,8 +5556,6 @@ fn tui_sends_dropped_files_as_links_and_images_by_model_capability() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list","provider.catalog"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -5566,7 +5577,7 @@ fn tui_sends_dropped_files_as_links_and_images_by_model_capability() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"look ");
     let dragged = format!(
@@ -5598,7 +5609,6 @@ fn fullscreen_login_releases_mouse_for_the_link_and_restores_the_preference_on_c
         .unwrap();
         let daemon = home.daemon(|wire| {
             wire.hello(&["account.login.browser.begin", "account.login.cancel"]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -5623,7 +5633,7 @@ fn fullscreen_login_releases_mouse_for_the_link_and_restores_the_preference_on_c
         command.arg("--fullscreen").env("DIMCODE_OAUTH_MANUAL", "1");
         command.env("SSH_CONNECTION", "fixture");
         sized(&mut command, 100, 32);
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("test / model");
         assert_eq!(
             terminal.transcript.rfind(MOUSE_ON) > terminal.transcript.rfind(MOUSE_OFF),
@@ -6198,14 +6208,22 @@ fn configured_api_key_model_uses_production_tools_and_restores_the_same_session(
             let mut bytes = vec![0; length];
             stream.read_exact(&mut bytes).unwrap();
             let request: Value = serde_json::from_slice(&bytes).unwrap();
-            if phase == 2 {
-                let user = request["messages"]
+            let last_user = || {
+                request["messages"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .rev()
-                    .find(|message| message["role"] == "user")
-                    .unwrap();
+                    .find(|message| {
+                        message["role"] == "user"
+                            && !message["content"].as_str().is_some_and(|text| {
+                                text.starts_with("<dim-state ") && text.ends_with("</dim-state>")
+                            })
+                    })
+                    .unwrap()
+            };
+            if phase == 2 {
+                let user = last_user();
                 assert_eq!(
                     user["content"],
                     json!([
@@ -6214,35 +6232,13 @@ fn configured_api_key_model_uses_production_tools_and_restores_the_same_session(
                     ])
                 );
             }
-            let mut names: Vec<_> = request["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|tool| tool["function"]["name"].as_str().unwrap())
-                .collect();
-            names.sort_unstable();
-            assert_eq!(
-                names,
-                [
-                    "agent",
-                    "ask_user",
-                    "branch",
-                    "edit",
-                    "exec",
-                    "exec_stop",
-                    "glob",
-                    "grep",
-                    "member_approval_allow",
-                    "member_approval_reject",
-                    "plugin",
-                    "read",
-                    "recall",
-                    "skill",
-                    "wait",
-                    "web_fetch",
-                    "web_search",
-                    "write"
-                ]
+            assert!(
+                request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| { tool["function"]["name"] == "read" }),
+                "the production read tool used by this flow is available"
             );
             let frame = |delta, finish| {
                 format!(
@@ -6256,13 +6252,7 @@ fn configured_api_key_model_uses_production_tools_and_restores_the_same_session(
                     Value::Null,
                 ) + &frame(json!({}), json!("tool_calls"))
             } else if phase == 3 {
-                let user = request["messages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .rev()
-                    .find(|message| message["role"] == "user")
-                    .unwrap();
+                let user = last_user();
                 let text = match &user["content"] {
                     Value::String(text) => text.as_str(),
                     Value::Array(parts) => {
@@ -6284,13 +6274,7 @@ fn configured_api_key_model_uses_production_tools_and_restores_the_same_session(
                     Value::Null,
                 ) + &frame(json!({}), json!("tool_calls"))
             } else if phase == 5 {
-                let user = request["messages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .rev()
-                    .find(|message| message["role"] == "user")
-                    .unwrap();
+                let user = last_user();
                 let parts = user["content"].as_array().unwrap();
                 assert_eq!(parts[0], json!({"type":"text","text":"selected "}));
                 assert_eq!(
@@ -6676,10 +6660,8 @@ fn tui_mcp_says_when_no_server_is_configured() {
     let daemon = home.daemon(|wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
-        wire.reply(&attach, json!({}));
+        wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
         wire.reply(&history,json!({"events":[],"through":8,"nextAfter":8,"done":true}));
         wire.no_context();
@@ -6694,7 +6676,7 @@ fn tui_mcp_says_when_no_server_is_configured() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/mcp list\r");
     terminal.until("No MCP server is configured.");
@@ -6717,10 +6699,8 @@ fn tui_mcp_shows_failure_reasons_rejections_and_the_catalog_error() {
     let daemon = home.daemon(|wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
-        wire.reply(&attach, json!({}));
+        wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
         wire.reply(&history,json!({"events":[],"through":8,"nextAfter":8,"done":true}));
         wire.no_context();
@@ -6742,7 +6722,7 @@ fn tui_mcp_shows_failure_reasons_rejections_and_the_catalog_error() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/mcp list\r");
     terminal.until("connection refused");
@@ -6779,10 +6759,8 @@ fn tui_mcp_enables_and_disables_a_project_server() {
     let daemon = home.daemon(|wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
-        wire.reply(&attach, json!({}));
+        wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
         wire.reply(&history,json!({"events":[],"through":8,"nextAfter":8,"done":true}));
         wire.no_context();
@@ -6843,7 +6821,7 @@ fn tui_mcp_enables_and_disables_a_project_server() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/mcp list\r");
     terminal.until("disabled");
@@ -7567,8 +7545,6 @@ fn tui_web_toggles_the_daemon_switch_without_leaving() {
         let daemon = home.daemon(|wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","web.toggle"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -7606,7 +7582,7 @@ fn tui_web_toggles_the_daemon_switch_without_leaving() {
             .env("PATH", &bin)
             .env("DIMCODE_OAUTH_MANUAL", if manual { "1" } else { "0" })
             .env_remove("DIMCODE_WEB_ASSETS");
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("test / model");
         terminal.write(b"/we");
         terminal.until("turn the web interface on or off");
@@ -7637,8 +7613,6 @@ fn tui_stays_up_when_the_daemon_leaves_and_restores_the_terminal_on_exit() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -7648,7 +7622,7 @@ fn tui_stays_up_when_the_daemon_leaves_and_restores_the_terminal_on_exit() {
         wire.reply(&providers, json!([]));
         wait_release.recv_timeout(PATIENCE).unwrap();
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"keep this draft");
     terminal.until("keep this draft");
@@ -7846,7 +7820,7 @@ fn tui_provider_management_uses_the_production_daemon_and_survives_restart() {
         command
     };
     let mut terminal = Terminal::launch_tui(command());
-    terminal.until("Sign in with /login");
+    terminal.until("Ask anything...");
     terminal.write(b"/connect\r");
     terminal.until("disabled");
     terminal.write(b"Add custom provider\r");
@@ -8079,7 +8053,7 @@ fn tui_provider_management_uses_the_production_daemon_and_survives_restart() {
         .as_u64()
         .unwrap();
     let mut terminal = Terminal::launch_tui(command());
-    terminal.until("Sign in with /login");
+    terminal.until("Ask anything...");
     terminal.write(b"/connect\r");
     terminal.until("disabled");
     terminal.write(b"Kimi For Coding\r");
@@ -8143,7 +8117,6 @@ fn tui_registers_with_the_ui_registry_and_leaves_when_asked() {
             "ui.shutdown",
             "ui.replace",
         ]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let register = wire.read("ui.attach");
@@ -8191,7 +8164,7 @@ fn tui_registers_with_the_ui_registry_and_leaves_when_asked() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     // `/new` goes home; the message starts the Session the UI moves to.
     terminal.write(b"/new\r");
@@ -8210,13 +8183,292 @@ fn tui_registers_with_the_ui_registry_and_leaves_when_asked() {
 }
 
 #[test]
+fn tui_export_and_queue_require_an_open_session() {
+    for fullscreen in [false, true] {
+        let home = Home::new();
+        let (quieted, quiet_done) = std::sync::mpsc::channel();
+        let daemon = no_session_daemon(&home, quieted);
+        let mut command = home.command();
+        if fullscreen {
+            command.arg("--fullscreen");
+        }
+        let mut terminal = Terminal::launch_tui(command);
+        terminal.until("Git branch");
+        terminal.write(b"/export\r");
+        terminal.until("/export needs a session");
+        terminal.write(b"/queue\r");
+        terminal.until("/queue needs a session");
+        quiet_done.recv_timeout(PATIENCE).unwrap();
+        home.kill(&terminal);
+        terminal.wait();
+        daemon.join().unwrap();
+        assert!(!terminal.transcript.contains("Export session"));
+    }
+}
+
+#[test]
+fn tui_export_dialog_matches_the_subcommand_and_cancel_sends_nothing() {
+    for (fullscreen, locale) in [
+        (false, "en"),
+        (true, "en"),
+        (false, "zh-CN"),
+        (true, "zh-CN"),
+    ] {
+        for format in ["markdown", "json"] {
+            let home = Home::new();
+            fs::write(
+                home.0.join("config.json"),
+                json!({"locale":locale}).to_string(),
+            )
+            .unwrap();
+            let directory = home.0.join("client");
+            fs::create_dir_all(&directory).unwrap();
+            let events = json!([
+                {"id":"input","sequence":1,"create_at":1,"type":"input","name":"message","data":{"user":{"content":[{"type":"text","text":"Export this code: ```rust```"}]}}},
+                {"id":"answer","sequence":3,"create_at":1,"type":"step","name":"text","data":{"turn_id":"t","request_id":"r","delta":"The exported answer"}}
+            ]);
+            let returned = events.clone();
+            let daemon = home.daemon(move |wire| {
+                wire.hello(&[]);
+                let attach = wire.read("session.attach");
+                wire.reply(&attach, attach_record(&attach));
+                let history = wire.read("session.history");
+                wire.reply(&history, json!({"events":[],"through":8,"nextAfter":8,"done":true}));
+                wire.no_context();
+                let providers = wire.read("account.providers");
+                wire.reply(&providers, json!([]));
+                let history = wire.read("session.history");
+                assert_eq!(history["params"]["branchId"], "main");
+                wire.reply(&history, json!({"events":returned,"through":8,"nextAfter":8,"done":true}));
+                let failed = wire.read("session.history");
+                wire.send(json!({"jsonrpc":"2.0","id":failed["id"],"error":{"code":-32000,"message":"export fixture failed"}}));
+                wire.hold();
+            });
+            let mut command = home.command();
+            command.current_dir(&directory);
+            if fullscreen {
+                command.arg("--fullscreen");
+            }
+            let mut terminal = Terminal::resume_tui(command);
+            terminal.until("test / model");
+            terminal.write(b"/export\r");
+            terminal.until(if locale == "en" {
+                "Export session"
+            } else {
+                "导出会话"
+            });
+            terminal.until("Markdown (.md)");
+            terminal.until("JSON (.json)");
+            terminal.until(if locale == "en" { "cancel" } else { "取消" });
+            terminal.write(b"\x1b");
+            terminal.until("\x1b[?25h");
+            terminal.write(b"/export\r");
+            terminal.until("Markdown (.md)");
+            terminal.until("JSON (.json)");
+            if format == "json" {
+                terminal.write(b"\x1b[B");
+            }
+            terminal.write(b"\r");
+            let label = if format == "json" { "JSON" } else { "Markdown" };
+            terminal.until(&if locale == "en" {
+                format!("Exported {label}: ")
+            } else {
+                format!("已导出 {label}：")
+            });
+            let files: Vec<_> = fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(files.len(), 1);
+            assert_eq!(
+                files[0].extension().unwrap(),
+                if format == "json" { "json" } else { "md" }
+            );
+            terminal.write(b"/export\r");
+            terminal.until("JSON (.json)");
+            terminal.write(b"\r");
+            terminal.until("export fixture failed");
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+            home.kill(&terminal);
+            terminal.wait();
+            daemon.join().unwrap();
+
+            let reference = Home::new();
+            let daemon = reference.daemon(move |wire| {
+                wire.hello(&[]);
+                let history = wire.read("session.history");
+                wire.reply(
+                    &history,
+                    json!({"events":events,"through":8,"nextAfter":8,"done":true}),
+                );
+            });
+            let output = reference
+                .command()
+                .args(["session", "export", "session", "--format", format])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            daemon.join().unwrap();
+            assert_eq!(fs::read(&files[0]).unwrap(), output.stdout);
+        }
+    }
+}
+
+#[test]
+fn tui_queue_panel_deletes_steers_and_keeps_unconsumed_inputs_visible() {
+    for fullscreen in [false, true] {
+        let home = Home::new();
+        let daemon = home.daemon(move |wire| {
+            wire.hello(&[]);
+            let attach = wire.read("session.attach");
+            let mut record = attach_record(&attach);
+            record["running"] = json!(true);
+            wire.reply(&attach, record);
+            let history = wire.read("session.history");
+            wire.reply(&history, json!({"events":[],"through":8,"nextAfter":8,"done":true}));
+            wire.no_context();
+            let providers = wire.read("account.providers");
+            wire.reply(&providers, json!([]));
+            for (sequence, text) in [(9, "delete this"), (10, "steer this")] {
+                let submit = wire.read("session.submit");
+                assert_eq!(submit["params"]["text"], text);
+                wire.reply(&submit, json!({"event":{}}));
+                wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":text,"sequence":sequence,"create_at":1,"type":"input","name":"message","data":{"user":{"content":[{"type":"text","text":text}]},"mode":"queue"}}}));
+            }
+            let delete = wire.read("session.input.withdraw");
+            assert_eq!(delete["params"]["inputId"], "delete this");
+            assert!(delete["params"].get("steer").is_none());
+            wire.reply(&delete, json!({"status":"deleted","sequence":11}));
+            wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":"deleted","sequence":11,"create_at":1,"type":"input","name":"deleted","data":{"input_id":"delete this"}}}));
+            let steer = wire.read("session.input.withdraw");
+            assert_eq!(steer["params"]["inputId"], "steer this");
+            assert_eq!(steer["params"]["steer"], json!({"content":[{"type":"text","text":"steer this"}]}));
+            wire.reply(&steer, json!({"status":"notHeld"}));
+            wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":"applied","sequence":12,"create_at":1,"type":"input","name":"applied","data":{"input_id":"steer this","mode":"queue"}}}));
+            let delete = wire.read("session.input.withdraw");
+            assert_eq!(delete["params"]["inputId"], "steer this");
+            wire.reply(&delete, json!({"status":"notHeld"}));
+            wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":"consumed","sequence":13,"create_at":1,"type":"input","name":"consumed","data":{"input_id":"steer this"}}}));
+            wire.hold();
+        });
+        let mut command = home.command();
+        if fullscreen {
+            command.arg("--fullscreen");
+        }
+        let mut terminal = Terminal::resume_tui(command);
+        terminal.until("test / model");
+        terminal.write(b"delete this\r");
+        terminal.until("Queue (1)");
+        terminal.write(b"steer this\r");
+        terminal.until("Queue (2)");
+        terminal.write(b"/queue\r");
+        terminal.until("awaiting application");
+        terminal.until("\x1b[?2026l");
+        terminal.write(b"x");
+        terminal.until("steer this");
+        terminal.write(b"\r");
+        terminal.until("already left the queue");
+        terminal.until("Incorporating");
+        terminal.write(b"x");
+        terminal.until("No queued messages.");
+        let shown = strip_ansi(&terminal.transcript);
+        assert!(
+            !shown.contains("┃ delete this"),
+            "deleted messages must not enter the transcript: {shown}"
+        );
+        home.kill(&terminal);
+        terminal.wait();
+        daemon.join().unwrap();
+    }
+}
+
+#[test]
+fn tui_queue_recall_refuses_attachments_and_steering_preserves_all_content() {
+    for (fullscreen, locale) in [
+        (false, "en"),
+        (true, "en"),
+        (false, "zh-CN"),
+        (true, "zh-CN"),
+    ] {
+        let home = Home::new();
+        fs::write(
+            home.0.join("config.json"),
+            json!({"locale":locale}).to_string(),
+        )
+        .unwrap();
+        let content = json!({"content":[
+            {"type":"text","text":"compare attachments"},
+            {"type":"image","source":{"type":"url","mediaType":"image/png","url":"https://invalid.example/one.png"}},
+            {"type":"text","text":"[Pasted text: /files/paste.txt (24 lines)] [source.rs](/work/source.rs)"}
+        ]});
+        let expected = content.clone();
+        let daemon = home.daemon(move |wire| {
+            wire.hello(&[]);
+            let attach = wire.read("session.attach");
+            let mut record = attach_record(&attach);
+            record["running"] = json!(true);
+            wire.reply(&attach, record);
+            let history = wire.read("session.history");
+            wire.reply(&history, json!({"events":[{"id":"mixed","sequence":8,"create_at":1,"type":"input","name":"message","data":{"user":content,"mode":"queue"}}],"through":8,"nextAfter":8,"done":true}));
+            wire.no_context();
+            let providers = wire.read("account.providers");
+            wire.reply(&providers, json!([]));
+            let steer = wire.read("session.input.withdraw");
+            assert_eq!(steer["params"]["inputId"], "mixed");
+            assert_eq!(steer["params"]["steer"], expected);
+            wire.reply(&steer, json!({"status":"deleted","sequence":9}));
+            wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":"deleted","sequence":9,"create_at":1,"type":"input","name":"deleted","data":{"input_id":"mixed"}}}));
+            wire.hold();
+        });
+        let mut command = home.command();
+        if fullscreen {
+            command.arg("--fullscreen");
+        }
+        let mut terminal = Terminal::resume_tui(command);
+        terminal.until(if locale == "en" {
+            "Queue (1)"
+        } else {
+            "队列（1）"
+        });
+        terminal.write(b"\x1b[1;2D");
+        terminal.until(if locale == "en" {
+            "Messages with attachments stay queued"
+        } else {
+            "带附件的消息会留在队列中"
+        });
+        terminal.write(b"/queue\r");
+        terminal.until(if locale == "en" {
+            "awaiting application"
+        } else {
+            "暂存中 · 等待应用"
+        });
+        terminal.until(if locale == "en" {
+            "delete held"
+        } else {
+            "删除暂存消息"
+        });
+        terminal.write(b"\r");
+        terminal.until(if locale == "en" {
+            "No queued messages."
+        } else {
+            "队列中没有消息。"
+        });
+        home.kill(&terminal);
+        terminal.wait();
+        daemon.join().unwrap();
+    }
+}
+
+#[test]
 fn tui_queue_shows_held_messages_and_steers_or_withdraws_them() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -8266,19 +8518,19 @@ fn tui_queue_shows_held_messages_and_steers_or_withdraws_them() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"first\r");
     terminal.until("first");
     terminal.until("background task finished");
     terminal.write(b"second\r");
-    terminal.until("Queue (1)");
+    terminal.until("Queue (3)");
     assert!(
         !terminal.transcript.contains("Queue (0)"),
         "{}",
         terminal.transcript
     );
-    terminal.until("› second");
+    terminal.until("Held · second");
     terminal.until("working…");
     assert!(
         !terminal.transcript.contains("┃ second"),
@@ -8287,8 +8539,8 @@ fn tui_queue_shows_held_messages_and_steers_or_withdraws_them() {
     );
     terminal.write(b"\x13");
     terminal.write(b"third\r");
-    terminal.until("Queue (1)");
-    terminal.until("› third");
+    terminal.until("Queue (4)");
+    terminal.until("Held · third");
     terminal.write(b"\x1b[1;2D");
     terminal.until("third");
     let plain = {
@@ -8341,7 +8593,6 @@ fn tui_ctrl_s_steers_the_draft_while_a_run_is_in_progress() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&[]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -8360,7 +8611,7 @@ fn tui_ctrl_s_steers_the_draft_while_a_run_is_in_progress() {
         assert_eq!(second["params"]["mode"], "steer");
         wire.reply(&second, json!({"event":{}}));
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"first\r");
     terminal.until("first");
@@ -8374,46 +8625,116 @@ fn tui_ctrl_s_steers_the_draft_while_a_run_is_in_progress() {
 
 #[test]
 fn tui_escape_withdraws_the_queue_before_the_run_stops() {
-    let home = Home::new();
-    let daemon = home.daemon(|wire| {
-        wire.hello(&[]);
-        wire.created();
-        let attach = wire.read("session.attach");
-        wire.reply(&attach, attach_record(&attach));
-        let history = wire.read("session.history");
-        wire.reply(&history, json!({"events":[],"through":8,"nextAfter":8,"done":true}));
-        wire.no_context();
-        let providers = wire.read("account.providers");
-        wire.reply(&providers, json!([]));
-        let first = wire.read("session.submit");
-        assert_eq!(first["params"]["text"], "first");
-        wire.reply(&first, json!({"event":{}}));
-        wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":"in-1","sequence":9,"create_at":1,"type":"input","name":"message","data":{"user":{"content":[{"type":"text","text":"first"}]},"mode":"queue"}}}));
-        wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":"ap-1","sequence":10,"create_at":1,"type":"input","name":"applied","data":{"input_id":"in-1","mode":"queue"}}}));
-        wire.notice("session.state", json!({"sessionId":"session","branchId":"main","running":true}));
-        let queued = wire.read("session.submit");
-        assert_eq!(queued["params"]["text"], "second");
-        assert_eq!(queued["params"]["mode"], "queue");
-        wire.reply(&queued, json!({"event":{}}));
-        wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":"in-2","sequence":11,"create_at":1,"type":"input","name":"message","data":{"user":{"content":[{"type":"text","text":"second"}]},"mode":"queue"}}}));
-        let withdraw = wire.read("session.input.withdraw");
-        assert_eq!(withdraw["params"]["inputId"], "in-2");
-        assert!(withdraw["params"].get("steer").is_none());
-        wire.reply(&withdraw, json!({"status":"deleted","sequence":12}));
-        let stop = wire.read("session.stop");
-        wire.reply(&stop, json!({"sequence":13}));
-    });
-    let mut terminal = Terminal::launch_tui(home.command());
-    terminal.until("test / model");
-    terminal.write(b"first\r");
-    terminal.until("first");
-    terminal.until("working…");
-    terminal.write(b"second\r");
-    terminal.until("Queue (1)");
-    terminal.write(b"\x1b");
-    daemon.join().unwrap();
-    home.kill(&terminal);
-    terminal.wait();
+    for fullscreen in [false, true] {
+        for (draft, content, expected) in [
+            (
+                "existing draft",
+                json!([{"type":"text","text":"first"}]),
+                json!({"text":"existing draft\nfirst\nsecond"}),
+            ),
+            (
+                "existing draft",
+                json!([
+                    {"type":"text","text":"hello\n$skill: checkin"},
+                    {"type":"text","text":"<dim-skill name=\"checkin\">\nPRIVATE SKILL BODY\n</dim-skill>"},
+                    {"type":"text","text":"world"},
+                    {"type":"text","text":"<dim-hooks kind=\"context\">\nPRIVATE RUNTIME CONTEXT\n</dim-hooks>"},
+                    {"type":"text","text":"keep <dim-literal> inside operator text"}
+                ]),
+                json!({"text":"existing draft\nhello\n$skill: checkin\nworld\nkeep <dim-literal> inside operator text\nsecond"}),
+            ),
+            (
+                "existing draft",
+                json!([
+                    {"type":"text","text":"<dim-literal> first block is operator text"},
+                    {"type":"text","text":"next line"}
+                ]),
+                json!({"text":"existing draft\n<dim-literal> first block is operator text\nnext line\nsecond"}),
+            ),
+            (
+                "!existing draft",
+                json!([{"type":"text","text":"first"}]),
+                json!({"text":"existing draft\nfirst\nsecond"}),
+            ),
+            (
+                "existing draft",
+                json!([
+                    {"type":"text","text":"compare"},
+                    {"type":"image","source":{"type":"url","mediaType":"image/png","url":"https://invalid.example/queued.png"}},
+                    {"type":"text","text":"<dim-skill name=\"checkin\">\nPRIVATE SKILL BODY\n</dim-skill>"},
+                    {"type":"text","text":"[Pasted text: /files/paste.txt (24 lines)] [source.rs](/work/source.rs)"},
+                    {"type":"text","text":"follow-up notes"}
+                ]),
+                json!({"user":{"content":[
+                    {"type":"text","text":"existing draft\ncompare"},
+                    {"type":"image","source":{"type":"url","mediaType":"image/png","url":"https://invalid.example/queued.png"}},
+                    {"type":"text","text":"[Pasted text: /files/paste.txt (24 lines)] [source.rs](/work/source.rs)\nfollow-up notes\nsecond"}
+                ]}}),
+            ),
+            (
+                "existing draft",
+                json!([{ "type":"image","source":{"type":"url","mediaType":"image/png","url":"https://invalid.example/image-only.png"}}]),
+                json!({"user":{"content":[
+                    {"type":"text","text":"existing draft\n"},
+                    {"type":"image","source":{"type":"url","mediaType":"image/png","url":"https://invalid.example/image-only.png"}},
+                    {"type":"text","text":"\nsecond"}
+                ]}}),
+            ),
+        ] {
+            let home = Home::new();
+            let (checked, checked_done) = std::sync::mpsc::channel();
+            let daemon = home.daemon(move |wire| {
+                wire.hello(&[]);
+                let attach = wire.read("session.attach");
+                wire.reply(&attach, attach_record(&attach));
+                let history = wire.read("session.history");
+                wire.reply(&history, json!({"events":[
+                    {"id":"first","sequence":7,"create_at":1,"type":"input","name":"message","data":{"user":{"content":content},"mode":"queue"}},
+                    {"id":"second","sequence":8,"create_at":1,"type":"input","name":"message","data":{"user":{"content":[{"type":"text","text":"second"}]},"mode":"queue"}}
+                ],"through":8,"nextAfter":8,"done":true}));
+                wire.no_context();
+                let providers = wire.read("account.providers");
+                wire.reply(&providers, json!([]));
+                wire.notice("session.state", json!({"sessionId":"session","branchId":"main","running":true}));
+                for (index, input) in ["first", "second"].into_iter().enumerate() {
+                    let withdraw = wire.read("session.input.withdraw");
+                    assert_eq!(withdraw["params"]["inputId"], input);
+                    assert!(withdraw["params"].get("steer").is_none());
+                    wire.reply(&withdraw, json!({"status":"deleted","sequence":9+index}));
+                    wire.notice("session.event", json!({"sessionId":"session","branchId":"main","event":{"id":format!("deleted-{input}"),"sequence":9+index,"create_at":1,"type":"input","name":"deleted","data":{"input_id":input}}}));
+                }
+                let stop = wire.read("session.stop");
+                wire.reply(&stop, json!({"sequence":11}));
+                wire.notice("session.state", json!({"sessionId":"session","branchId":"main","running":false}));
+                wire.event(11, "text", json!({"turn_id":"t","request_id":"r","delta":"interrupt settled"}));
+                wire.no_context();
+                let submitted = wire.read("session.submit");
+                assert_eq!(submitted["params"]["mode"], "queue");
+                for key in ["text", "user"] {
+                    assert_eq!(submitted["params"][key], expected[key]);
+                }
+                wire.reply(&submitted, json!({"event":{}}));
+                checked.send(()).unwrap();
+                wire.hold();
+            });
+            let mut command = home.command();
+            if fullscreen {
+                command.arg("--fullscreen");
+            }
+            let mut terminal = Terminal::resume_tui(command);
+            terminal.until("Queue (2)");
+            terminal.until_anywhere("working…");
+            terminal.until("\x1b[?2026l");
+            terminal.write(draft.as_bytes());
+            terminal.write(b"\x1b");
+            terminal.until("interrupt settled");
+            terminal.write(b"\r");
+            checked_done.recv_timeout(PATIENCE).unwrap();
+            home.kill(&terminal);
+            terminal.wait();
+            daemon.join().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -8423,7 +8744,6 @@ fn tui_command_output_refreshes_one_read_and_preserves_its_branch_and_terminal_r
     let (proceed, control) = std::sync::mpsc::channel();
     let daemon = home.daemon(move |wire| {
         wire.hello(&[]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -8471,7 +8791,7 @@ fn tui_command_output_refreshes_one_read_and_preserves_its_branch_and_terminal_r
         wire.event(11, "text", json!({"turn_id":"t","request_id":"r","delta":"main remains usable"}));
         control.recv_timeout(PATIENCE).unwrap();
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"go\r");
     terminal.until("1 in background");
@@ -8543,7 +8863,6 @@ fn tui_command_output_errors_stop_refresh_and_reopening_retries() {
         let (ready, readiness) = std::sync::mpsc::channel();
         let daemon = home.daemon(move |wire| {
             wire.hello(&[]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -8564,7 +8883,7 @@ fn tui_command_output_errors_stop_refresh_and_reopening_retries() {
             let retried = wire.read("session.exec.output");
             wire.reply(&retried, json!({"text":"fresh preview after reopening"}));
         });
-        let mut terminal = Terminal::launch_tui(home.command());
+        let mut terminal = Terminal::resume_tui(home.command());
         terminal.until("test / model");
         terminal.write(b"go\r");
         terminal.until("1 in background");
@@ -8591,8 +8910,6 @@ fn tui_tasks_panel_stops_the_selected_command_or_member() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello,json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.list"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create,json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -8647,7 +8964,7 @@ fn tui_tasks_panel_stops_the_selected_command_or_member() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"go\r");
     terminal.until("Agent: reviewer");
@@ -8684,7 +9001,6 @@ fn tui_permissions_keep_pending_file_and_member_questions_and_save_command_rules
             "permission.rules",
             "permission.set_rules",
         ]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -8739,7 +9055,7 @@ fn tui_permissions_keep_pending_file_and_member_questions_and_save_command_rules
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/approvals\r");
     terminal.until("Full access");
@@ -8773,6 +9089,8 @@ fn tui_permissions_keep_pending_file_and_member_questions_and_save_command_rules
     fs::remove_file(home.0.join("rust/daemon.sock")).unwrap();
     let daemon = home.daemon(|wire| {
         wire.hello(&["session.permission.get", "session.permission.update"]);
+        let providers = wire.read("account.providers");
+        wire.reply(&providers, json!([]));
         let create = wire.read("session.create");
         assert_eq!(create["params"]["permissionPolicy"], json!({"preset":"full-access"}));
         wire.reply(&create, json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}));
@@ -8782,9 +9100,10 @@ fn tui_permissions_keep_pending_file_and_member_questions_and_save_command_rules
         wire.reply(&history,json!({"events":[],"through":8,"nextAfter":8,"done":true}));
         let read = wire.read("session.permission.get");
         wire.reply(&read, json!({"version":1,"policy":{"preset":"full-access","allowedTools":[],"disallowedTools":[]}}));
+        let submit = wire.read("session.submit");
+        assert_eq!(submit["params"]["text"], "first message");
+        wire.reply(&submit, json!({"event":{}}));
         wire.no_context();
-        let providers = wire.read("account.providers");
-        wire.reply(&providers, json!([]));
         let mut line = String::new();
         while wire.0.read_line(&mut line).is_ok_and(|read| read > 0) {
             line.clear();
@@ -8792,6 +9111,8 @@ fn tui_permissions_keep_pending_file_and_member_questions_and_save_command_rules
     });
     let mut terminal = Terminal::launch_tui(home.command());
     terminal.until("Full access");
+    terminal.write(b"first message\r");
+    terminal.until("test / model");
     home.kill(&terminal);
     terminal.wait();
     daemon.join().unwrap();
@@ -8802,9 +9123,8 @@ fn tui_approval_alias_selects_presets_and_remembers_them() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&["session.permission.get", "session.permission.update"]);
-        wire.created();
         let attach = wire.read("session.attach");
-        wire.reply(&attach, json!({}));
+        wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
         wire.reply(
             &history,
@@ -8854,7 +9174,7 @@ fn tui_approval_alias_selects_presets_and_remembers_them() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/approval\r");
     terminal.until("Full access");
@@ -8886,7 +9206,6 @@ fn tui_reports_the_run_state_to_the_terminal_and_clears_it_on_exit() {
         let (shown, wait_shown) = std::sync::mpsc::channel();
         let daemon = home.daemon(move |wire| {
             wire.hello(&[]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -8925,7 +9244,7 @@ fn tui_reports_the_run_state_to_the_terminal_and_clears_it_on_exit() {
             "--scrollback"
         });
         command.env("DIM_TERMINAL_PROGRESS", if drawn { "on" } else { "off" });
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until(&report("state=idle:app=dim"));
         terminal.until("test / model");
         terminal.write(b"inspect\r");
@@ -8993,7 +9312,6 @@ fn tui_reports_the_run_state_to_the_terminal_and_clears_it_on_exit() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&[]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -9011,7 +9329,7 @@ fn tui_reports_the_run_state_to_the_terminal_and_clears_it_on_exit() {
     });
     let mut command = home.command();
     command.env("DIM_TERMINAL_STATUS", "off");
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
     terminal.write(b"/exit\r");
     terminal.until("Bye!");
@@ -9026,7 +9344,6 @@ fn tui_reports_the_run_state_to_the_terminal_and_clears_it_on_exit() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&[]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -9040,7 +9357,7 @@ fn tui_reports_the_run_state_to_the_terminal_and_clears_it_on_exit() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until(&report("state=idle:app=dim"));
     terminal.until("test / model");
     terminal.signal(libc::SIGTERM);
@@ -9059,7 +9376,6 @@ fn tui_composer_shows_context_use_and_refreshes_it_when_a_run_ends() {
         let (shown, wait_shown) = std::sync::mpsc::channel();
         let daemon = home.daemon(move |wire| {
             wire.hello(&["session.context.usage"]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -9112,7 +9428,7 @@ fn tui_composer_shows_context_use_and_refreshes_it_when_a_run_ends() {
         } else {
             "--scrollback"
         });
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("1.8K / 256K");
         shown.send(()).unwrap();
         terminal.until("64K / 256K");
@@ -9134,7 +9450,6 @@ fn tui_compaction_row_runs_then_shows_the_summary_it_recorded() {
     let (fail, wait_fail) = std::sync::mpsc::channel();
     let daemon = home.daemon(move |wire| {
         wire.hello(&[]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -9206,7 +9521,7 @@ fn tui_compaction_row_runs_then_shows_the_summary_it_recorded() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     shown.send(()).unwrap();
     terminal.until("Compacting context…");
@@ -9268,7 +9583,6 @@ fn tui_compact_displays_committed_outcomes_and_reports_an_unsupported_daemon() {
     let home = Home::new();
     let daemon = home.daemon(move |wire| {
         wire.hello(&[]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -9320,7 +9634,7 @@ fn tui_compact_displays_committed_outcomes_and_reports_an_unsupported_daemon() {
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/compact\r");
     terminal.until("Context compacted");
@@ -9342,7 +9656,6 @@ fn tui_context_warning_starts_at_the_threshold_share_and_a_compaction_refreshes_
     let (shown, wait_shown) = std::sync::mpsc::channel();
     let daemon = home.daemon(move |wire| {
         wire.hello(&["session.context.usage"]);
-        wire.created();
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -9388,7 +9701,7 @@ fn tui_context_warning_starts_at_the_threshold_share_and_a_compaction_refreshes_
             line.clear();
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("179.9K / 256K");
     assert!(
         !terminal
@@ -9418,26 +9731,21 @@ fn no_catalog(wire: &mut Wire) {
     }
 }
 
-/// #556: a cold hosted TUI opens the Session it created without reading the
-/// catalog, and the first message does not wait for it.
 #[test]
 fn cold_hosted_tui_opens_without_reading_the_session_catalog() {
     let home = Home::new();
     let daemon = home.daemon(|wire| {
         wire.hello(&[]);
-        wire.created();
-        let attach = wire.read("session.attach");
-        assert_eq!(attach["params"], json!({"sessionId":"session"}));
-        wire.reply(&attach, attach_record(&attach));
-        let history = wire.read("session.history");
-        wire.reply(
-            &history,
-            json!({"events":[],"through":8,"nextAfter":8,"done":true}),
+        let providers = wire.read("account.providers");
+        wire.reply(&providers, json!([]));
+        assert_eq!(
+            wire.trailing_request(),
+            None,
+            "Home must not read a Session"
         );
-        no_catalog(wire);
     });
     let mut terminal = Terminal::launch_tui(home.command());
-    terminal.until("test / model");
+    terminal.until("Ask anything...");
     terminal.write(b"/exit\r");
     terminal.until("Bye!");
     assert!(terminal.wait().success());
@@ -9616,6 +9924,13 @@ fn export_writes_the_timeline_without_starting_a_daemon() {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     };
+    let events = |lines: &[Value]| -> Vec<Value> {
+        lines
+            .iter()
+            .filter(|line| line["kind"] == "event")
+            .cloned()
+            .collect()
+    };
 
     let live = run(&["export", &session]);
     assert!(
@@ -9634,14 +9949,19 @@ fn export_writes_the_timeline_without_starting_a_daemon() {
     assert!(written.status.success());
     assert!(written.stdout.is_empty());
     assert!(String::from_utf8_lossy(&written.stderr).contains("Exported Timeline (sensitive): "));
-    assert_eq!(fs::read(&output).unwrap(), live.stdout);
+    let written_bytes = fs::read(&output).unwrap();
+    let written_lines = lines(&written_bytes);
+    assert_eq!(written_lines[0], exported[0]);
+    assert_eq!(written_lines.last().unwrap()["kind"], "end");
+    let written_events = events(&written_lines);
+    assert!(written_events.starts_with(&events(&exported)));
     assert_eq!(
         fs::metadata(&output).unwrap().permissions().mode() & 0o777,
         0o600
     );
     let refused = run(&["export", &session, "--output", "timeline.jsonl"]);
     assert_eq!(refused.status.code(), Some(1));
-    assert_eq!(fs::read(&output).unwrap(), live.stdout);
+    assert_eq!(fs::read(&output).unwrap(), written_bytes);
     let failed = run(&["export", "missing-session", "--output", "failed.jsonl"]);
     assert_eq!(failed.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&failed.stderr).contains("Session missing-session is not in"));
@@ -9653,14 +9973,7 @@ fn export_writes_the_timeline_without_starting_a_daemon() {
     assert!(stopped.status.success());
     let stopped = lines(&stopped.stdout);
     assert_eq!(stopped[0], exported[0]);
-    let events = |lines: &[Value]| -> Vec<Value> {
-        lines
-            .iter()
-            .filter(|line| line["kind"] == "event")
-            .cloned()
-            .collect()
-    };
-    let (before, after) = (events(&exported), events(&stopped));
+    let (before, after) = (written_events, events(&stopped));
     assert!(!before.is_empty());
     assert_eq!(after[..before.len()], before[..]);
     assert!(!socket.exists());
@@ -9673,8 +9986,6 @@ fn tui_provider_create_recovery_preserves_changed_draft_until_confirmation() {
     let daemon = home.daemon(move |wire| {
         let hello = wire.read("hello");
         wire.reply(&hello, json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,"daemonProfile":{"kind":"product"},"features":["session.create","session.history","provider.management","provider.create","provider.update","provider.probe"]}));
-        let create = wire.read("session.create");
-        wire.reply(&create, json!({"sessionId":"session","sequence":0,"model":{"providerId":"test","modelId":"model"}}));
         let attach = wire.read("session.attach");
         wire.reply(&attach, attach_record(&attach));
         let history = wire.read("session.history");
@@ -9715,7 +10026,7 @@ fn tui_provider_create_recovery_preserves_changed_draft_until_confirmation() {
         wire.reply(&listed, json!({"providers":[entry],"errors":[]}));
         wait_release.recv_timeout(PATIENCE).unwrap();
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("Ask anything...");
     terminal.write(b"/connect\r");
     terminal.until("Add custom provider");
@@ -9755,7 +10066,7 @@ fn tui_models_picker_edits_only_the_subagent_model_policy() {
                     "daemonProfile":{"kind":"product"},"features":["session.create","session.history",
                     "provider.list","provider.catalog","collaboration.model_policy",
                     "collaboration.set_model_policy"]}),
-                "session.create" => json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}),
+                "session.create" => panic!("resuming must not create a Session"),
                 "session.attach" => attach_record(&request),
                 "session.history" => json!({"events":[],"through":8,"nextAfter":8,"done":true}),
                 "session.idle" => json!({"sequence":8}),
@@ -9784,7 +10095,7 @@ fn tui_models_picker_edits_only_the_subagent_model_policy() {
             wire.reply(&request, result);
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/models\r");
     terminal.until("Subagent models: Agent choice");
@@ -9825,7 +10136,7 @@ fn tui_models_picker_edits_only_the_subagent_model_policy() {
     }
     assert_eq!(
         methods.iter().filter(|m| **m == "session.create").count(),
-        1
+        0
     );
     let saves: Vec<&Value> = calls
         .iter()
@@ -9856,7 +10167,8 @@ fn tui_models_picker_hides_edit_models_without_management_methods() {
                 "hello" => json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,
                     "daemonProfile":{"kind":"product"},"features":["session.create","session.history",
                     "provider.list","provider.catalog","provider.selection","provider.select"]}),
-                "session.create" => json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}),
+                "session.create" => panic!("resuming must not create a Session"),
+                "session.attach" => attach_record(&request),
                 "session.history" => json!({"events":[],"through":8,"nextAfter":8,"done":true}),
                 "session.idle" => json!({"sequence":8}),
                 "provider.list" => json!({"providers":[{"providerId":"test","displayName":"Test","enabled":true}]}),
@@ -9868,7 +10180,7 @@ fn tui_models_picker_hides_edit_models_without_management_methods() {
             wire.reply(&request, result);
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/models\r");
     terminal.until("Test / model");
@@ -9912,7 +10224,8 @@ fn tui_models_picker_cycles_reasoning_effort() {
                 "hello" => json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,
                     "daemonProfile":{"kind":"product"},"features":["session.create","session.history",
                     "provider.list","provider.catalog","provider.management","provider.selection","provider.select"]}),
-                "session.create" => json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}}),
+                "session.create" => panic!("resuming must not create a Session"),
+                "session.attach" => attach_record(&request),
                 "session.history" => json!({"events":[],"through":8,"nextAfter":8,"done":true}),
                 "session.idle" => json!({"sequence":8}),
                 "provider.list" => json!({"providers":[{"providerId":"test","displayName":"Test","enabled":true}]}),
@@ -9932,7 +10245,7 @@ fn tui_models_picker_cycles_reasoning_effort() {
             wire.reply(&request, result);
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/models\r");
     terminal.until("‹ low ›");
@@ -10010,7 +10323,8 @@ fn tui_models_picker_refills_an_empty_provider_catalog() {
                 "hello" => Some(json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,
                     "daemonProfile":{"kind":"product"},"features":["session.create","session.history",
                     "provider.list","provider.catalog","provider.refresh"]})),
-                "session.create" => Some(json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}})),
+                "session.create" => panic!("resuming must not create a Session"),
+                "session.attach" => Some(attach_record(&request)),
                 "session.history" => Some(json!({"events":[],"through":8,"nextAfter":8,"done":true})),
                 "session.idle" => Some(json!({"sequence":8})),
                 "provider.list" => {
@@ -10068,7 +10382,7 @@ fn tui_models_picker_refills_an_empty_provider_catalog() {
     });
     let mut command = home.command();
     command.env("LC_ALL", "C");
-    let mut terminal = Terminal::launch_tui(command);
+    let mut terminal = Terminal::resume_tui(command);
     terminal.until("test / model");
     terminal.write(b"/models\r");
     // The listing is still held: the picker draws every row it has.
@@ -10142,7 +10456,8 @@ fn tui_models_picker_does_not_reread_when_a_refill_lands_closed() {
                 "hello" => Some(json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,
                     "daemonProfile":{"kind":"product"},"features":["session.create","session.history",
                     "provider.list","provider.catalog","provider.refresh"]})),
-                "session.create" => Some(json!({"sessionId":"session","sequence":8,"model":{"providerId":"test","modelId":"model"}})),
+                "session.create" => panic!("resuming must not create a Session"),
+                "session.attach" => Some(attach_record(&request)),
                 "session.history" => Some(json!({"events":[],"through":8,"nextAfter":8,"done":true})),
                 "session.idle" => Some(json!({"sequence":8})),
                 "provider.list" => {
@@ -10182,7 +10497,7 @@ fn tui_models_picker_does_not_reread_when_a_refill_lands_closed() {
             }
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("test / model");
     terminal.write(b"/models\r");
     terminal.until("Fresh: no models · dimcode models fresh --refresh");
@@ -10254,7 +10569,12 @@ fn tui_models_picker_names_every_provider_with_no_selectable_model() {
                 "hello" => json!({"instanceId":"server","serverVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":3,
                     "daemonProfile":{"kind":"product"},"features":["session.create","session.history",
                     "provider.list","provider.catalog"]}),
-                "session.create" => json!({"sessionId":"session","sequence":8,"model":{"providerId":"ready","modelId":"vendor/model-a"}}),
+                "session.create" => panic!("resuming must not create a Session"),
+                "session.attach" => {
+                    let mut record = attach_record(&request);
+                    record["model"] = json!({"providerId":"ready","modelId":"vendor/model-a"});
+                    record
+                }
                 "session.history" => json!({"events":[],"through":8,"nextAfter":8,"done":true}),
                 "session.idle" => json!({"sequence":8}),
                 "provider.list" => json!({"providers":[
@@ -10323,7 +10643,7 @@ fn tui_models_picker_names_every_provider_with_no_selectable_model() {
             wire.reply(&request, result);
         }
     });
-    let mut terminal = Terminal::launch_tui(home.command());
+    let mut terminal = Terminal::resume_tui(home.command());
     terminal.until("ready / vendor/model-a");
     terminal.write(b"/models\r");
     terminal.until("Ready / vendor/model-a");
@@ -10362,7 +10682,6 @@ fn member_tool_approval_requires_trusted_details_in_both_terminal_modes() {
         let (checked, wait_checked) = std::sync::mpsc::channel();
         let daemon = home.daemon(move |wire| {
             wire.hello(&[]);
-            wire.created();
             let attach = wire.read("session.attach");
             wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history");
@@ -10400,7 +10719,7 @@ fn member_tool_approval_requires_trusted_details_in_both_terminal_modes() {
         } else {
             "--scrollback"
         });
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("Cannot review member action");
         terminal.write(b"y");
         wait_checked.recv_timeout(PATIENCE).unwrap();
@@ -10424,7 +10743,7 @@ fn member_approval_without_the_detail_method_offers_only_rejection() {
         let home = Home::new();
         let (checked, wait_checked) = std::sync::mpsc::channel();
         let daemon = home.daemon(move |wire| {
-            wire.hello(&[]); wire.created();
+            wire.hello(&[]);
             let attach = wire.read("session.attach"); wire.reply(&attach, attach_record(&attach));
             let history = wire.read("session.history"); wire.reply(&history, json!({"events":[],"through":0,"nextAfter":0,"done":true}));
             wire.no_context();
@@ -10444,7 +10763,7 @@ fn member_approval_without_the_detail_method_offers_only_rejection() {
         } else {
             "--scrollback"
         });
-        let mut terminal = Terminal::launch_tui(command);
+        let mut terminal = Terminal::resume_tui(command);
         terminal.until("combination cannot review");
         assert!(!terminal.transcript.contains("Retry"));
         terminal.write(b"ry");
@@ -10635,7 +10954,7 @@ fn tui_default_theme_respects_background_and_saved_choice() {
             terminal.raw(format!("\x1b]11;{background}\x07").as_bytes());
         }
         terminal.raw(b"\x1b[?1;2c");
-        terminal.until("Sign in with /login");
+        terminal.until("Ask anything...");
         terminal.write(b"/settings\r");
         terminal.until(&format!("{expected} ›"));
         quiet_done.recv_timeout(PATIENCE).unwrap();

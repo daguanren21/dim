@@ -669,6 +669,11 @@ async fn run_connection(
                             if rpc.stopping.is_cancelled() {
                                 return Err(RpcError::reloading());
                             }
+                            if params.protocol_version == PROTOCOL_VERSION && entry != Entry::Bare {
+                                connection.follow_ui_extensions(&rpc.ctx).map_err(|error| {
+                                    RpcError::service("service_unavailable", error.to_string())
+                                })?;
+                            }
                             let instance = rpc.index.server_instance_id().to_owned();
                             connection
                                 .instance
@@ -723,12 +728,15 @@ async fn run_connection(
                                     {
                                         features.extend([
                                             "session.history",
+                                            "session.submit",
+                                            "session.stop",
                                             "session.keys",
                                             "session.input_lookup",
                                             "session.create",
                                             "session.delete",
                                             "session.model.progress",
                                             "session.methods",
+                                            "session.branch_create",
                                             "session.branch_end",
                                             "session.create.origin",
                                         ]);

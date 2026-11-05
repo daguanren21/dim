@@ -102,8 +102,9 @@ For development against the repository checkout, and for a build that must carry
 | Item | Rule |
 | --- | --- |
 | Version | `hello` v3 with `clientKind: "web"`; v1/v2 → `protocol_version` |
-| Methods | Rpc Session built-ins and execution Session methods on every Session of the host, plus the explicit settings methods in §4.3. Other management methods, including `daemon.shutdown` and Web-entry controls, return `-32601 unknown_method` |
+| Methods | Rpc Session built-ins and execution Session methods on every Session of the host, plus the explicit settings methods in §4.3 and read-only discovery methods below. Other management methods, including `daemon.shutdown` and Web-entry controls, return `-32601 unknown_method` |
 | Model list | The read-only management methods `provider.list`, `provider.catalog`, `provider.selection` and `account.providers` are also served (decision Q1); their replies carry no credentials (`provider.list` reports only `credentialConfigured` and header names). Managed Provider discovery follows §4.2. Switching uses the Session method `session.model.update` |
+| UI directory | UiExtensions contributes `ui.extensions.list`, which is explicitly allowlisted and advertised in `hello.features` while available. Connection forwards `ui.extensions.changed` over the reliable control channel; clients refetch the directory on this notice. No other contributed management method becomes reachable |
 
 Compatibility: the bare `/ws` keeps today's rules (`hello` and `daemon.ping` only in protected profiles). Execution Session methods become reachable from the web entry; this is the same widening RemoteGateway records as E3, limited here to loopback connections authenticated by the local user's token.
 
@@ -190,7 +191,28 @@ A line is a Timeline of the same Session ([Timeline branches](timeline-branches.
 | Errors | `branch_missing`, `branch_ended`, `input_blocked`, an invalid cut and a disabled Branch tool are shown at the action that raised them; an ended line is read-only |
 | State | Line tabs are per Session and live in `stores/ui.ts`; the tree is rebuilt from facts on reload and reconnect. No line list method or storage format is added |
 
-**Not in this phase:** session fork, a drawn DAG, compare/adopt, per-line model selection and questions (`ask_user`). Each needs its own client design.
+**Not in this phase:** session fork, a drawn DAG, compare/adopt and per-line model selection. Each needs its own client design.
+
+#### Questions
+
+A waiting `ask_user` call shows one question at a time, with question steps,
+Previous/Next controls and a final review for multi-question calls. Changing steps
+preserves selections and custom text. Single and multiple choices both require an
+explicit Next action; Enter in the answer field advances rather than submitting
+an incomplete call. Only the final Send answers action submits the entire call
+through `session.question.respond`. Decline still declines the whole call. Rejected
+answers preserve the draft; successful answers stay disabled until their result
+settles. Long content scrolls inside the current question, keeping navigation
+visible. The same prompt serves main and child lines.
+
+```text
+ Dim has a question              Awaiting answer
+ [1. Database] [2. Features] [Review]
+ Which database?
+ ( ) SQLite   ( ) PostgreSQL
+ [Type your own answer]
+ [Decline]                  [Previous] [Next]
+```
 
 ### 4.2 Model discovery and slash commands
 
@@ -364,8 +386,8 @@ optional account feature must not prevent identity or usage from loading.
 | Modality | Operation defaults for image generation, editing, enhancement and understanding from `modality.capabilities`, written with `modality.configure` and its snapshot revision; understanding's Session consumer is a requirement on Agent/Prompt |
 | MCP | List, add/edit transports, enable/disable, test, authentication/sign-out, confirmed removal and user↔project scope migration; secret fields stay omitted from edits and a move never writes them into `.mcp.json` |
 | Plugins | List, enable/disable, installation/update/removal and the owner's typed settings surfaces |
-| Skills | List, enable/disable, source installation, update and confirmed removal |
-| Permissions | Default execution/network settings and user-scope command-rule management (exact/prefix allow/deny; project scope, patterns and per-rule ask are rejected, [§10.1](appserver/permission-command-rules.md#101-legacy-rule-kinds)), with confirmation for privilege increases. The Execution card reads `host.execution.backend` and shows the owner's sandbox-backend reason when the host has none; the browser never infers the platform |
+| Skills | Manage already installed skills: search, inspect details, enable/disable and reload discovery; choose user scope or an existing workspace without entering filesystem paths. Source installation and plugin-package controls are not part of this page |
+| Permissions | Process isolation and user-scope command-rule management (exact/prefix allow/deny; project scope, patterns and per-rule ask are rejected, [§10.1](appserver/permission-command-rules.md#101-legacy-rule-kinds)), with confirmation for privilege increases. The isolation card follows [the CLI isolation choices](cli-commands.md#process-isolation-settings), reads `host.execution.backend` and shows the owner's reason when the host has none; the browser never infers the platform |
 | Scheduled tasks | List, create/edit, pause/resume, run now, recent runs and confirmed deletion through the [Scheduler management contract](plugins/Scheduler.md#a3-management-methods); no raw Settings document access |
 | Archived sessions | Search, restore/open and confirmed permanent deletion |
 | Diagnostics | Safe version, protocol, connection and metadata with refresh, the model-request recording switch, and the start-up rule for process logs instead of a log-mode control ([logging controls](#diagnostics-the-legacy-logging-controls)) |
@@ -373,6 +395,44 @@ optional account feature must not prevent identity or usage from loading.
 Use the current owner's semantics when old terminology no longer describes the
 system, and document the mapping. Reuse existing Settings, MCP, PluginManager,
 Skills and Session owners rather than adding parallel browser-only state.
+
+#### Settings scope
+
+Scope selectors offer the user configuration and known Session workspaces, with
+the host path identifying each workspace. They do not ask for browser-local paths.
+Agent's scope applies only to the default model for new Sessions; collaboration
+policy and the command shell remain user-wide. MCP's workspace adds that project's
+servers to the catalog, not a working-directory override for any server. Skills'
+workspace includes project discovery. Saved sessions instead has an all-workspace
+filter; it never changes configuration. Switching configuration scope confirms
+discarding unsaved edits, and a cancelled or failed load keeps the previous scope.
+
+Process isolation is one choice: Off, Sandboxed without network, or Sandboxed
+with network. Off preserves the stored, inactive network flag; confirmed reset
+writes the owner's defaults (both flags off). Writes use the revision actually
+displayed; a conflict preserves the draft and requires an explicit reload rather
+than automatically retrying. Unsupported server methods are errors, not inferred
+defaults. The setting affects new host commands, not existing processes or
+persistent shells, and does not change a Session's permission preset.
+
+#### Skills interaction
+
+The Skills page reads `skills.catalog`, changes individual skills through
+`skills.set_enabled`, and rescans through `skills.refresh` before reading the
+catalog again. Scope selection uses the existing Session workspace directory;
+without a workspace it shows user skills. A row shows its name, description and
+enabled or shadowed state. Paths and declared tools are collapsed details, not
+editable directory settings. Search and scope survive a reload; discovery issues,
+failed writes and empty or unmatched lists remain distinguishable. Installation
+APIs stay with the Skills owner; package installation and activation stay on Plugins.
+
+```text
+ Skills                         [Reload skills]
+ [User skills / workspace]      [Search skills]
+ name                 Enabled       [Disable]
+ description
+ > Details
+```
 
 #### Scheduled tasks interaction
 
@@ -679,7 +739,6 @@ defaults, archive flags or copied credentials cannot substitute for owner behavi
 | --- | --- | --- |
 | [Modality](plugins/Modality.md) | Model capability declarations do not select or execute image generation, editing, enhancement or understanding tasks | Typed per-operation defaults with owner-computed options, effective automatic resolution and actionable reasons; `modality.capabilities`/`modality.configure` consumed by task dispatch; save persists before success; exactly those two methods admitted on the Web entry. Understanding's Session consumer is the Agent/Prompt requirement in Modality §9.4. |
 | [Session catalog](appserver/session-catalog.md) | A saved Session is not necessarily archived; reopening it cannot represent restore | Durable archive classification with search, restore and confirmed deletion; commit classification before publishing the new catalog view |
-| Skills | Plugin packages do not cover manifest-free skill repositories or selective installation | Owner-managed repository preview, selected installation and loose-skill update/removal, with explicit overwrite confirmation and catalog publication after persistence |
 | MCP | User and project sources have independent revisions, and safe projections deliberately hide credentials | `mcp.move` reads the complete entry internally, checks both source revisions, keeps withheld values in the user-scope `mcp-secrets` overlay instead of `.mcp.json`, starts a project destination disabled, and reports a partial move as an error recovered by direction (remove destination and retry, or remove source); exactly `mcp.move` is admitted for the control. |
 
 Legacy permission patterns and tracing behavior do not override the current
@@ -687,3 +746,53 @@ Legacy permission patterns and tracing behavior do not override the current
 the Permissions page follows
 [§10.1](appserver/permission-command-rules.md#101-legacy-rule-kinds). A change to
 either contract requires separate design alignment.
+
+## Client UI extensions
+
+The [client UI contract](client-ui-extensions.md) owns the manifest, mount
+boundary, bound capabilities and resource semantics. The Web adapter adds the
+exact read method `ui.extensions.list` to its management allowlist and subscribes
+to `ui.extensions.changed` on the reliable control channel before hello completes.
+It reads the directory after hello and refreshes on each invalidation; reconnect
+clears stale directory and panel state before binding again.
+
+Authenticated resource routes share this listener:
+
+| Route | Owner |
+| --- | --- |
+| `/api/ui/extensions/{generation}/{path}` | UiExtensions snapshot |
+| `/api/ui/sessions/{sessionId}/resources/{id}` | Session UiResources |
+
+Both routes preserve Host checking and cookies, reject an explicit foreign
+Origin or cross-site fetch, and allow same-origin GET without an Origin header.
+There is no resource SPA fallback. MIME and `nosniff` remain explicit; CSP and
+CORS are unchanged. Snapshot replies use private revalidation and ETags; Session
+files use private no-store. GET supports a single byte range, including suffix
+and open-ended ranges. HEAD ignores Range. Unsatisfiable ranges return 416 and
+the total length; multiple ranges and unknown units return the full file.
+Bounded producers apply backpressure and release file reads on disconnect or
+owner withdrawal. Active content from Session files is downloaded as octet-stream.
+
+AppShell places the selected extension in the existing Lines detail region.
+The UI store persists only its stable selection and existing size. Each panel
+component owns its ShadowRoot and mount lifetime; the connection store owns
+catalog synchronization and the chat store owns Session activity. Compact mode
+uses a native modal dialog with a host-owned close button, Escape handling and
+focus restoration. Panel keyboard events stay within the panel.
+
+The extension menu checks placement, declared capabilities and discovered
+Session methods before selection. Unavailable entries stay visible with their
+reason and cannot be selected. Session methods are refreshed when the binding
+or directory changes and when the menu gains focus; mounting rechecks them.
+
+```text
+Extensions:
+  Activity
+  Preview — Unavailable method: session.preview.open [disabled]
+Wide:    [Conversation] | [Extension title] [Lines] [Close]
+                       | [Bound line selector]
+                       | [Plugin ShadowRoot]
+Compact: [Modal title] [Close]
+         [Bound line selector]
+         [Plugin ShadowRoot]
+```
